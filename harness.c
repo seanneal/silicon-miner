@@ -562,7 +562,7 @@ static long parse_text_size(FILE *fp, int sysv) {
         }
         fputs(line, stdout);
         if (!sysv) {
-            /* Section (__TEXT, __text): 3412 */
+            /* Section (__TEXT, __text): <bytes> */
             if (strstr(line, "__text")) {
                 char *colon = strrchr(line, ':');
                 if (colon) text_bytes = strtol(colon + 1, NULL, 10);

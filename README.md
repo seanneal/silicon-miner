@@ -89,7 +89,7 @@ Prints `.text` size, `THREADS`, `ASM_H/s`, `CC_H/s`, and easy-target `TTFN_S`.
 |--------|------|
 | `_sha256_compress` | One 64-byte block; state in/out |
 | `_sha256d_genesis_selftest` | FIPS "abc" + genesis midstate mine; `0` = PASS |
-| `_sha256d_mine_midstate` | Dual-lane midstate loop, K-window staging, nonce splice, digest compare |
+| `_sha256d_mine_midstate` | Dual-lane midstate loop. Next-group schedule sits under `SHA256H`/`H2`; cached midstate/IV are added in place |
 
 ## Constraints
 
