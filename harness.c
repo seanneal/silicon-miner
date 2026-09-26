@@ -5,6 +5,7 @@
  * _sha256d_mine_midstate on disjoint nonce ranges. Stratum share checks are a
  * target inequality, so that loop partitions the same way and hashes each
  * slice with the existing asm compress (sha256d_asm_one).
+ * TIME_SPLIT (mono_clock.h) accounts wall time around those calls.
  */
 #include <stdio.h>
 #include <stdint.h>
@@ -15,6 +16,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <stdatomic.h>
+#include "mono_clock.h"
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -116,6 +118,174 @@ static double monotonic_seconds(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+/*
+ * TIME_SPLIT
+ * ----------
+ * Per-slice buckets, summed on the main thread after join. The hot nonce
+ * loop only writes its own slice. No lock around the hash.
+ *
+ * Exclusive wall (TIME_SPLIT / TIME_SPLIT_PCT sum to elapsed):
+ *   hash_s + share_s + submit-from-workers = time a worker batch was in
+ *     flight, split by that batch's CPU ticks (asm vs C check vs enqueue).
+ *   poll_s, midstate_s, submit_s (main-thread writes) = work done while
+ *     no batch was in flight, so it stalls the next hash.
+ *   other_s = the rest of the wall clock (status lines, select after the
+ *     workers have already finished, pool-reply drain).
+ *
+ * TIME_SPLIT_OVERLAP is main-thread poll / midstate / submit that ran
+ * while a batch was in flight. It is concurrent with hash and is not
+ * part of the 100% line.
+ *
+ * TIME_SPLIT_CPU is the sum across threads (hash can exceed wall).
+ *
+ * Clock: see mono_clock.h. On macOS that is mach_absolute_time converted
+ * with mach_timebase_info. Elsewhere it is clock_gettime(CLOCK_MONOTONIC).
+ */
+static _Atomic int g_time_split_on = 0;
+static _Atomic uint64_t g_tick_overhead = 0;
+
+static uint64_t g_cpu_hash_ticks;
+static uint64_t g_cpu_share_ticks;
+static uint64_t g_cpu_submit_ticks;
+static uint64_t g_flight_wall_ns;
+static uint64_t g_stall_poll_ns;
+static uint64_t g_stall_mid_ns;
+static uint64_t g_stall_submit_ns;
+static uint64_t g_overlap_poll_busy_ns;
+static uint64_t g_overlap_poll_wait_ns;
+static uint64_t g_overlap_mid_ns;
+static uint64_t g_overlap_submit_ns;
+/* How many instrumented share-scan slices were summed. Self-test checks it. */
+static uint64_t g_scan_slices_timed;
+/* Main thread only. Set while a testnet scan batch is running. */
+static int g_in_flight;
+
+static int time_split_on(void) {
+    return atomic_load_explicit(&g_time_split_on, memory_order_acquire);
+}
+
+static uint64_t tick_overhead(void) {
+    return atomic_load_explicit(&g_tick_overhead, memory_order_relaxed);
+}
+
+static uint64_t calibrate_tick_overhead(void) {
+    enum { N = 64 };
+    uint64_t v[N];
+    for (int i = 0; i < N; i++) {
+        uint64_t a = mono_ticks();
+        uint64_t b = mono_ticks();
+        v[i] = b - a;
+    }
+    for (int i = 1; i < N; i++) {
+        uint64_t x = v[i];
+        int j = i;
+        while (j > 0 && v[j - 1] > x) {
+            v[j] = v[j - 1];
+            j--;
+        }
+        v[j] = x;
+    }
+    return v[N / 2];
+}
+
+static void time_split_reset(void) {
+    (void)mono_ns();
+    atomic_store_explicit(&g_tick_overhead, calibrate_tick_overhead(), memory_order_relaxed);
+    g_cpu_hash_ticks = 0;
+    g_cpu_share_ticks = 0;
+    g_cpu_submit_ticks = 0;
+    g_flight_wall_ns = 0;
+    g_stall_poll_ns = 0;
+    g_stall_mid_ns = 0;
+    g_stall_submit_ns = 0;
+    g_overlap_poll_busy_ns = 0;
+    g_overlap_poll_wait_ns = 0;
+    g_overlap_mid_ns = 0;
+    g_overlap_submit_ns = 0;
+    g_scan_slices_timed = 0;
+    g_in_flight = 0;
+    atomic_store_explicit(&g_time_split_on, 1, memory_order_release);
+}
+
+static void time_split_off(void) {
+    atomic_store_explicit(&g_time_split_on, 0, memory_order_release);
+}
+
+static void account_mid_ns(uint64_t dt) {
+    if (!time_split_on()) return;
+    if (g_in_flight) g_overlap_mid_ns += dt;
+    else g_stall_mid_ns += dt;
+}
+
+static void account_submit_ns(uint64_t dt) {
+    if (!time_split_on()) return;
+    if (g_in_flight) g_overlap_submit_ns += dt;
+    else g_stall_submit_ns += dt;
+}
+
+static double ns_to_s(uint64_t ns) {
+    return (double)ns / 1e9;
+}
+
+static double ticks_to_s(uint64_t ticks) {
+    return (double)mono_ticks_to_ns(ticks) / 1e9;
+}
+
+static void time_split_print(double wall_s) {
+    if (wall_s < 1e-9) wall_s = 1e-9;
+
+    double hash_cpu = ticks_to_s(g_cpu_hash_ticks);
+    double share_cpu = ticks_to_s(g_cpu_share_ticks);
+    double submit_cpu = ticks_to_s(g_cpu_submit_ticks);
+    double worker = hash_cpu + share_cpu + submit_cpu;
+    double flight = ns_to_s(g_flight_wall_ns);
+    if (flight > wall_s) flight = wall_s;
+
+    double hash_s, share_s, submit_flight;
+    if (worker > 0.0 && flight > 0.0) {
+        hash_s = flight * (hash_cpu / worker);
+        share_s = flight * (share_cpu / worker);
+        submit_flight = flight * (submit_cpu / worker);
+    } else if (flight > 0.0) {
+        hash_s = flight;
+        share_s = 0.0;
+        submit_flight = 0.0;
+    } else {
+        hash_s = 0.0;
+        share_s = 0.0;
+        submit_flight = 0.0;
+    }
+
+    double poll_s = ns_to_s(g_stall_poll_ns);
+    double mid_s = ns_to_s(g_stall_mid_ns);
+    double submit_s = ns_to_s(g_stall_submit_ns) + submit_flight;
+    double sum = hash_s + share_s + poll_s + mid_s + submit_s;
+    if (sum > wall_s && sum > 0.0) {
+        double scale = wall_s / sum;
+        hash_s *= scale;
+        share_s *= scale;
+        poll_s *= scale;
+        mid_s *= scale;
+        submit_s *= scale;
+        sum = wall_s;
+    }
+    double other_s = wall_s - sum;
+    if (other_s < 0.0) other_s = 0.0;
+
+    double pct = 100.0 / wall_s;
+    printf("TIME_SPLIT hash_s=%.4f share_s=%.4f poll_s=%.4f midstate_s=%.4f submit_s=%.4f other_s=%.4f\n",
+           hash_s, share_s, poll_s, mid_s, submit_s, other_s);
+    printf("TIME_SPLIT_PCT hash=%.2f share=%.2f poll=%.2f midstate=%.2f submit=%.2f other=%.2f\n",
+           hash_s * pct, share_s * pct, poll_s * pct, mid_s * pct, submit_s * pct, other_s * pct);
+    printf("TIME_SPLIT_CPU hash_s=%.4f share_s=%.4f submit_s=%.4f\n",
+           hash_cpu, share_cpu, submit_cpu);
+    printf("TIME_SPLIT_FLIGHT flight_s=%.4f\n", flight);
+    printf("TIME_SPLIT_OVERLAP poll_busy_s=%.4f poll_wait_s=%.4f midstate_s=%.4f submit_s=%.4f\n",
+           ns_to_s(g_overlap_poll_busy_ns), ns_to_s(g_overlap_poll_wait_ns),
+           ns_to_s(g_overlap_mid_ns), ns_to_s(g_overlap_submit_ns));
+    printf("TIME_SPLIT_CLOCK=%s\n", mono_clock_name());
 }
 
 /*
@@ -334,6 +504,10 @@ typedef struct {
     uint32_t found;
     int hit;
     int pin_index;
+    int timed;
+    uint64_t t_start_ns;
+    uint64_t t_end_ns;
+    uint64_t hash_ticks;
 } mine_slice_t;
 
 typedef struct {
@@ -352,6 +526,12 @@ typedef struct {
     const char *job_id;
     const char *ntime;
     uint64_t en2;
+    int timed;
+    uint64_t t_start_ns;
+    uint64_t t_end_ns;
+    uint64_t hash_ticks;
+    uint64_t share_ticks;
+    uint64_t submit_ticks;
 } scan_slice_t;
 
 typedef struct {
@@ -366,9 +546,20 @@ static void *mine_slice_worker(void *arg) {
     mine_slice_t *s = (mine_slice_t *)arg;
     worker_qos_hint(s->pin_index);
     uint32_t found = 0;
+    int timing = time_split_on();
+    uint64_t t0 = 0;
+    if (timing) {
+        s->t_start_ns = mono_ns();
+        t0 = mono_ticks();
+    }
     s->hit = sha256d_mine_midstate(s->mid, s->w_be, s->nonce_start, s->nonce_count,
                                    s->expect, &found);
     s->found = found;
+    if (timing) {
+        s->hash_ticks = mono_ticks() - t0;
+        s->t_end_ns = mono_ns();
+        s->timed = 1;
+    }
     return NULL;
 }
 
@@ -379,20 +570,67 @@ static void *scan_slice_worker(void *arg) {
     s->hit = 0;
     s->found = 0;
     s->hashed = 0;
+    s->timed = 0;
+    s->hash_ticks = 0;
+    s->share_ticks = 0;
+    s->submit_ticks = 0;
+    s->t_start_ns = 0;
+    s->t_end_ns = 0;
+
+    int timing = time_split_on();
+    uint64_t ov = timing ? tick_overhead() : 0;
+    uint64_t t_enter = 0;
+    uint64_t hash_raw = 0;
+    uint64_t submit_ticks = 0;
+    uint32_t timed_n = 0;
+    if (timing) {
+        s->t_start_ns = mono_ns();
+        t_enter = mono_ticks();
+    }
+
     for (uint32_t i = 0; i < s->nonce_count; i++) {
         if (g_stop || atomic_load_explicit(&g_scan_cancel, memory_order_relaxed))
             break;
         uint32_t nonce = s->nonce_start + i;
-        sha256d_asm_one(s->mid, s->w_be, nonce, dig);
+        if (timing) {
+            uint64_t a = mono_ticks();
+            sha256d_asm_one(s->mid, s->w_be, nonce, dig);
+            hash_raw += mono_ticks() - a;
+            timed_n++;
+        } else {
+            sha256d_asm_one(s->mid, s->w_be, nonce, dig);
+        }
         s->hashed++;
         if (stratum_hash_meets_target(dig, s->target)) {
             s->hit = 1;
             s->found = nonce;
-            if (s->job_id)
-                (void)share_q_push(s->job_id, s->ntime, s->en2, nonce);
+            if (s->job_id) {
+                if (timing) {
+                    uint64_t d0 = mono_ticks();
+                    (void)share_q_push(s->job_id, s->ntime, s->en2, nonce);
+                    submit_ticks += mono_ticks() - d0;
+                } else {
+                    (void)share_q_push(s->job_id, s->ntime, s->en2, nonce);
+                }
+            }
             break;
         }
     }
+
+    if (timing) {
+        /* hash_raw includes one clock read per nonce. Pull that back out
+         * so share_check is the C target compare (and the cancel load),
+         * not the timer. See calibrate_tick_overhead. */
+        uint64_t total = mono_ticks() - t_enter;
+        uint64_t pull = (uint64_t)timed_n * ov;
+        s->hash_ticks = hash_raw > pull ? hash_raw - pull : 0;
+        s->submit_ticks = submit_ticks;
+        uint64_t used = hash_raw + submit_ticks + pull;
+        s->share_ticks = total > used ? total - used : 0;
+        s->t_end_ns = mono_ns();
+        s->timed = 1;
+    }
+
     if (s->finished)
         atomic_fetch_add_explicit(s->finished, 1, memory_order_release);
     return NULL;
@@ -429,6 +667,39 @@ static int earlier_hit(int any, uint32_t best_off, uint32_t start, uint32_t foun
     return (uint32_t)(found - start) < best_off;
 }
 
+static void account_mine_slices(const mine_slice_t *s, int n) {
+    if (!time_split_on() || n < 1) return;
+    uint64_t lo = UINT64_MAX;
+    uint64_t hi = 0;
+    int any = 0;
+    for (int i = 0; i < n; i++) {
+        if (!s[i].timed) continue;
+        any = 1;
+        if (s[i].t_start_ns < lo) lo = s[i].t_start_ns;
+        if (s[i].t_end_ns > hi) hi = s[i].t_end_ns;
+        g_cpu_hash_ticks += s[i].hash_ticks;
+    }
+    if (any && hi > lo) g_flight_wall_ns += hi - lo;
+}
+
+static void account_scan_slices(const scan_slice_t *s, int n) {
+    if (!time_split_on() || n < 1) return;
+    uint64_t lo = UINT64_MAX;
+    uint64_t hi = 0;
+    int any = 0;
+    for (int i = 0; i < n; i++) {
+        if (!s[i].timed) continue;
+        any = 1;
+        g_scan_slices_timed++;
+        if (s[i].t_start_ns < lo) lo = s[i].t_start_ns;
+        if (s[i].t_end_ns > hi) hi = s[i].t_end_ns;
+        g_cpu_hash_ticks += s[i].hash_ticks;
+        g_cpu_share_ticks += s[i].share_ticks;
+        g_cpu_submit_ticks += s[i].submit_ticks;
+    }
+    if (any && hi > lo) g_flight_wall_ns += hi - lo;
+}
+
 /*
  * Equality-gated mine. threads<=1 (or a single slice) calls
  * sha256d_mine_midstate directly so the one-thread path stays the same.
@@ -446,8 +717,18 @@ static int mine_midstate_n(const uint32_t mid[8], const uint32_t w_be[16],
     int used = partition_nonce_ranges(nonce_start, nonce_count, threads, starts, counts);
     if (used <= 1) {
         apply_worker_pin(0);
-        return sha256d_mine_midstate(mid, w_be, nonce_start, nonce_count,
-                                     expect, found_nonce);
+        if (!time_split_on()) {
+            return sha256d_mine_midstate(mid, w_be, nonce_start, nonce_count,
+                                         expect, found_nonce);
+        }
+        uint64_t t_start = mono_ns();
+        uint64_t a = mono_ticks();
+        int hit = sha256d_mine_midstate(mid, w_be, nonce_start, nonce_count,
+                                        expect, found_nonce);
+        g_cpu_hash_ticks += mono_ticks() - a;
+        uint64_t t_end = mono_ns();
+        if (t_end > t_start) g_flight_wall_ns += t_end - t_start;
+        return hit;
     }
 
     mine_slice_t slices[MAX_MINE_THREADS];
@@ -460,8 +741,13 @@ static int mine_midstate_n(const uint32_t mid[8], const uint32_t w_be[16],
         slices[i].found = 0;
         slices[i].hit = 0;
         slices[i].pin_index = i;
+        slices[i].timed = 0;
+        slices[i].t_start_ns = 0;
+        slices[i].t_end_ns = 0;
+        slices[i].hash_ticks = 0;
     }
     run_workers(used, mine_slice_worker, slices, sizeof slices[0]);
+    account_mine_slices(slices, used);
 
     int any = 0;
     uint32_t best = 0;
@@ -514,12 +800,19 @@ static scan_result_t scan_share_n(const uint32_t mid[8], const uint32_t w_be[16]
         slices[i].job_id = NULL;
         slices[i].ntime = NULL;
         slices[i].en2 = 0;
+        slices[i].timed = 0;
+        slices[i].t_start_ns = 0;
+        slices[i].t_end_ns = 0;
+        slices[i].hash_ticks = 0;
+        slices[i].share_ticks = 0;
+        slices[i].submit_ticks = 0;
     }
     if (used <= 1) {
         scan_slice_worker(&slices[0]);
     } else {
         run_workers(used, scan_slice_worker, slices, sizeof slices[0]);
     }
+    account_scan_slices(slices, used);
 
     uint32_t best_off = 0;
     for (int i = 0; i < used; i++) {
@@ -795,6 +1088,7 @@ static int run_selftest(int threads) {
         }
     }
 
+    time_split_reset();
     if (selftest_threaded_genesis(1) != 0)
         return 1;
     if (threads != 1 && selftest_threaded_genesis(threads) != 0)
@@ -803,6 +1097,17 @@ static int run_selftest(int threads) {
         return 1;
     if (threads != 1 && selftest_scan_once(threads) != 0)
         return 1;
+    if (g_cpu_hash_ticks == 0 || g_cpu_share_ticks == 0 ||
+        g_flight_wall_ns == 0 || g_scan_slices_timed == 0) {
+        printf("SELFTEST: FAIL (TIME_SPLIT empty hash_ticks=%llu share_ticks=%llu flight_ns=%llu scan_slices=%llu)\n",
+               (unsigned long long)g_cpu_hash_ticks,
+               (unsigned long long)g_cpu_share_ticks,
+               (unsigned long long)g_flight_wall_ns,
+               (unsigned long long)g_scan_slices_timed);
+        return 1;
+    }
+    printf("SELFTEST: TIME_SPLIT counters armed\n");
+    time_split_off();
     return 0;
 }
 
@@ -871,7 +1176,10 @@ static void share_q_flush(stratum_client_t *c) {
         }
         it = g_share_q[g_share_head];
         pthread_mutex_unlock(&g_share_mu);
-        if (stratum_submit_async(c, it.job_id, it.en2, it.ntime, it.nonce) != 0)
+        uint64_t t0 = time_split_on() ? mono_ns() : 0;
+        int rc = stratum_submit_async(c, it.job_id, it.en2, it.ntime, it.nonce);
+        if (t0) account_submit_ns(mono_ns() - t0);
+        if (rc != 0)
             return;
         pthread_mutex_lock(&g_share_mu);
         g_share_head = (g_share_head + 1) % SHARE_Q;
@@ -885,8 +1193,13 @@ static void share_q_flush(stratum_client_t *c) {
 }
 
 static int prepare_work(stratum_client_t *c, work_buf_t *w, uint64_t en2) {
+    int timing = time_split_on();
+    uint64_t t0 = timing ? mono_ns() : 0;
     uint8_t header[80];
-    if (stratum_build_header(c, en2, 0, header) != 0) return -1;
+    if (stratum_build_header(c, en2, 0, header) != 0) {
+        if (timing) account_mid_ns(mono_ns() - t0);
+        return -1;
+    }
     compute_midstate(w->mid, header);
     build_block1_wbe(w->w_be, header);
     stratum_share_target(c->difficulty, w->target);
@@ -897,6 +1210,7 @@ static int prepare_work(stratum_client_t *c, work_buf_t *w, uint64_t en2) {
     w->nonce_cursor = 0;
     w->clean = c->job.clean ? 1 : 0;
     w->ready = 1;
+    if (timing) account_mid_ns(mono_ns() - t0);
     return 0;
 }
 
@@ -924,6 +1238,7 @@ static void scan_join(scan_flight_t *f, scan_result_t *r) {
             best_off = f->slices[i].found - origin;
         }
     }
+    account_scan_slices(f->slices, f->n);
     f->running = 0;
     f->n = 0;
 }
@@ -996,6 +1311,7 @@ static int run_soak(const uint32_t mid[8], const uint32_t w_be[16],
     uint64_t hashes = 0;
     uint64_t hashes_mark = 0;
     uint32_t nonce = 0;
+    time_split_reset();
     double t0 = monotonic_seconds();
     double t_mark = t0;
     while (!g_stop) {
@@ -1028,6 +1344,8 @@ static int run_soak(const uint32_t mid[8], const uint32_t w_be[16],
     printf("SOAK_AVG_H/s=%.0f\n", hs);
     printf("H/s=%.0f\n", hs);
     printf("threads=%d\n", threads);
+    time_split_print(dt);
+    time_split_off();
     printf("RESULT: PASS\n");
     return 0;
 }
@@ -1037,7 +1355,24 @@ static int run_soak(const uint32_t mid[8], const uint32_t w_be[16],
  *  connect → jobs → hash workers
  *  main thread polls the socket while workers hash, stages the next job's
  *  midstate on the side, and sends shares without waiting for the reply.
+ *  TIME_SPLIT is printed with the summary.
  */
+
+static void poll_accounted(stratum_client_t *c, int timeout_ms) {
+    uint64_t w0 = c->poll_wait_ns;
+    uint64_t b0 = c->poll_busy_ns;
+    stratum_poll(c, timeout_ms);
+    if (!time_split_on()) return;
+    uint64_t dw = c->poll_wait_ns - w0;
+    uint64_t db = c->poll_busy_ns - b0;
+    if (g_in_flight) {
+        g_overlap_poll_wait_ns += dw;
+        g_overlap_poll_busy_ns += db;
+    } else {
+        /* No batch running: this poll stalls the next hash. */
+        g_stall_poll_ns += dw + db;
+    }
+}
 static int run_testnet(const char *host, int port, const char *user, const char *pass,
                        double suggest_diff, int seconds, int max_shares, int threads) {
     printf("\n=== TESTNET STRATUM ===\n");
@@ -1083,6 +1418,7 @@ static int run_testnet(const char *host, int port, const char *user, const char 
     uint64_t hashes = 0;
     uint64_t staged_while_hashing = 0;
     int staged = 0;
+    time_split_reset();
     double t0 = monotonic_seconds();
     double t_last_report = t0;
     scan_flight_t flight;
@@ -1095,16 +1431,17 @@ static int run_testnet(const char *host, int port, const char *user, const char 
 
         if (!flight.running) {
             if (!active.ready && prepare_work(&client, &active, active.en2) != 0) {
-                stratum_poll(&client, 50);
+                poll_accounted(&client, 50);
                 continue;
             }
             if (scan_start(&flight, &active, scan_batch, threads) != 0) {
                 fprintf(stderr, "STRATUM: scan_start failed\n");
                 break;
             }
+            g_in_flight = 1;
         }
 
-        stratum_poll(&client, 20);
+        poll_accounted(&client, 20);
         share_q_flush(&client);
 
         {
@@ -1129,6 +1466,9 @@ static int run_testnet(const char *host, int port, const char *user, const char 
             scan_result_t sr;
             uint32_t batch_start = active.nonce_cursor;
             int abandoned = atomic_load_explicit(&g_scan_cancel, memory_order_relaxed);
+            /* Workers have left the hash loop. Rebuilds and submits here
+             * stall the next batch, so they belong in the stall buckets. */
+            g_in_flight = 0;
             scan_join(&flight, &sr);
             hashes += sr.hashes;
             /* Hits were queued by the worker that found them, while the
@@ -1179,6 +1519,7 @@ static int run_testnet(const char *host, int port, const char *user, const char 
                 fprintf(stderr, "STRATUM: scan_start failed\n");
                 break;
             }
+            g_in_flight = 1;
         }
 
         now = monotonic_seconds();
@@ -1200,6 +1541,7 @@ static int run_testnet(const char *host, int port, const char *user, const char 
         }
     }
 
+    g_in_flight = 0;
     if (flight.running) {
         atomic_store_explicit(&g_scan_cancel, 1, memory_order_relaxed);
         scan_result_t sr;
@@ -1207,6 +1549,7 @@ static int run_testnet(const char *host, int port, const char *user, const char 
         hashes += sr.hashes;
     }
     share_q_flush(&client);
+    /* Reply wait is pool RTT. It stays in other_s, not submit_s or poll_s. */
     int pending_left = stratum_submit_drain(&client, 3000);
 
     double t1 = monotonic_seconds();
@@ -1230,6 +1573,8 @@ static int run_testnet(const char *host, int port, const char *user, const char 
     printf("elapsed_s=%.2f\n", dt);
     printf("expect_share_s@this_rate=%.2f\n",
            client.difficulty * 4294967296.0 / (hs > 1.0 ? hs : 1.0));
+    time_split_print(dt);
+    time_split_off();
 
     stratum_close(&client);
 
@@ -1385,6 +1730,7 @@ int main(int argc, char **argv) {
 #endif
     printf("TIMING: hashing %u nonces from 0x00000000 on %d thread(s) (expect no hit)...\n",
            batch, threads);
+    time_split_reset();
     double t0 = monotonic_seconds();
     int hit = mine_midstate_n(mid, w_be, 0u, batch, TARGET_NEVER, &found, threads);
     double t1 = monotonic_seconds();
@@ -1394,6 +1740,8 @@ int main(int argc, char **argv) {
     printf("TIMING: hit=%d  elapsed=%.6f s  threads=%d  H/s=%.0f\n", hit, dt, threads, hs);
     printf("H/s=%.0f\n", hs);
     printf("threads=%d\n", threads);
+    time_split_print(dt);
+    time_split_off();
 
     printf("ENERGY_PLACEHOLDER_IDLE_W=na\n");
     printf("ENERGY_PLACEHOLDER_PKG_W=na\n");

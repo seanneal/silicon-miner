@@ -10,6 +10,7 @@ Educational **Apple Silicon / M1** SHA-256d midstate miner.
 |------|------|
 | `sha256d_mine.s` | Pure ARM64 Crypto Extension hash path (`SHA256H` / `H2` / `SU0` / `SU1`) |
 | `harness.c` | Tests, timing, metrics, CLI, testnet mine loop (no hash logic) |
+| `mono_clock.h` | `TIME_SPLIT` clock: `mach_absolute_time` on macOS, `CLOCK_MONOTONIC` elsewhere |
 | `stratum.c` / `stratum.h` | Bitcoin Stratum V1 client (subscribe / authorize / notify / submit) |
 | `Makefile` | Build / clean / metrics / testnet |
 | `measure.sh` | Optional energy sample via `powermetrics` (needs sudo) |
@@ -100,6 +101,27 @@ make metrics
 ```
 
 Prints `.text` size, `THREADS`, `ASM_H/s`, `CC_H/s`, and easy-target `TTFN_S`.
+
+### Reading TIME_SPLIT
+
+The default timed batch, `--soak`, and the testnet summary print where the wall clock went. `TIME_SPLIT_PCT` is each bucket divided by elapsed time. The six percentages add to 100.
+
+| Field | Counts |
+|-------|--------|
+| `hash_s` | In-flight worker wall × the fraction of that batch spent in the asm call (`_sha256d_mine_midstate` offline, `sha256d_asm_one` / `sha256_compress` on the testnet scan) |
+| `share_s` | Same in-flight wall × the fraction spent in the per-nonce C target check and the rest of the scan loop |
+| `poll_s` | Main-thread `stratum_poll` while no batch is running (stalls the next hash) |
+| `midstate_s` | Header and midstate build while no batch is running |
+| `submit_s` | Share enqueue plus `mining.submit` writes while no batch is running |
+| `other_s` | Remainder of the wall clock: status lines, thread join gaps, and the end-of-run wait for pool replies |
+
+`TIME_SPLIT_OVERLAP` is poll, midstate build, and submit that ran **while a batch was hashing**. That time is concurrent with `hash_s`, so it stays off the 100% line. `poll_busy_s` is recv plus JSON. `poll_wait_s` is time blocked in `select`. A large `poll_wait_s` with a small `poll_s` means the socket wait overlapped hashing and did not stall it.
+
+`TIME_SPLIT_CPU` sums per-slice CPU time. `hash_s` there grows with thread count and can exceed the wall clock. `TIME_SPLIT_FLIGHT` is the in-flight wall before the hash/share/submit split.
+
+`TIME_SPLIT_CLOCK` names the clock. On macOS it is `mach_absolute_time` converted with `mach_timebase_info`. The qemu self-test uses `clock_gettime(CLOCK_MONOTONIC)`. Each worker keeps its own tick totals; the main thread adds them after join. A one-time median of an empty clock pair is removed from the testnet per-nonce samples so `share_s` tracks the C target check.
+
+Compare an offline `--soak` (dual-lane `_sha256d_mine_midstate`) with a testnet run (per-nonce asm compress plus C target check). The H/s gap is in the buckets, which is the reason to read them before changing the scan.
 
 **Optional energy** (needs sudo for `powermetrics`). The sample window is an offline multi-thread soak, not a short nonce batch, so package watts are taken while hashes are in flight. `W_PER_HASH` and `J_PER_HASH` use absolute package power over `SOAK_AVG_H/s` (`J/hash = W / (hash/s)`).
 

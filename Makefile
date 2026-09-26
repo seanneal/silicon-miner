@@ -24,10 +24,10 @@ all: $(TARGET)
 sha256d_mine.o: sha256d_mine.s
 	$(CC) $(ASFLAGS) -c -o $@ $<
 
-harness.o: harness.c stratum.h
+harness.o: harness.c stratum.h mono_clock.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-stratum.o: stratum.c stratum.h
+stratum.o: stratum.c stratum.h mono_clock.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(TARGET): $(OBJS)
@@ -73,10 +73,10 @@ $(ELF_ASM): sha256d_mine.s scripts/macho_to_elf_asm.py
 sha256d_mine.o: $(ELF_ASM)
 	$(CROSS) -c -o $@ $(ELF_ASM)
 
-harness.o: harness.c stratum.h
+harness.o: harness.c stratum.h mono_clock.h
 	$(CROSS) $(CFLAGS) -c -o $@ $<
 
-stratum.o: stratum.c stratum.h
+stratum.o: stratum.c stratum.h mono_clock.h
 	$(CROSS) $(CFLAGS) -c -o $@ $<
 
 $(TARGET): $(OBJS)
