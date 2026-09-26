@@ -7,10 +7,10 @@ ASFLAGS = $(ARCH)
 CFLAGS  = $(ARCH) -O2 -Wall -Wextra -std=c11
 LDFLAGS = $(ARCH)
 
-OBJS    = sha256d_mine.o harness.o
+OBJS    = sha256d_mine.o harness.o stratum.o
 TARGET  = miner_test
 
-.PHONY: all clean run metrics
+.PHONY: all clean run metrics testnet
 
 all: $(TARGET)
 
@@ -18,7 +18,10 @@ all: $(TARGET)
 sha256d_mine.o: sha256d_mine.s
 	$(CC) $(ASFLAGS) -c -o $@ $<
 
-harness.o: harness.c
+harness.o: harness.c stratum.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+stratum.o: stratum.c stratum.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(TARGET): $(OBJS)
@@ -33,6 +36,10 @@ metrics: $(TARGET)
 	size -m sha256d_mine.o
 	@echo "=== make metrics: harness --metrics ==="
 	./$(TARGET) --metrics
+
+# Bitcoin testnet3 via public BTCLab Stratum (throwaway tb1 user; suggest_diff=0.001)
+testnet: $(TARGET)
+	./$(TARGET) --testnet --seconds 90 --max-shares 1
 
 clean:
 	rm -f $(OBJS) $(TARGET)

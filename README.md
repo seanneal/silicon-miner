@@ -1,16 +1,17 @@
 # silicon-miner
 
-Educational **Apple Silicon / M1** SHA-256d midstate miner skeleton.
+Educational **Apple Silicon / M1** SHA-256d midstate miner.
 
-**Learning only — not for profit.** No Stratum, no pools, no networking, no BTC spend.
+**Learning only — not for profit.** Testnet Stratum is supported for education. No mainnet AntPool, no BTC spend.
 
 ## Layout (flat)
 
 | File | Role |
 |------|------|
 | `sha256d_mine.s` | Pure ARM64 Crypto Extension hash path (`SHA256H` / `H2` / `SU0` / `SU1`) |
-| `harness.c` | Tests, timing, metrics (no hash logic) |
-| `Makefile` | Build / clean / metrics |
+| `harness.c` | Tests, timing, metrics, CLI, testnet mine loop (no hash logic) |
+| `stratum.c` / `stratum.h` | Bitcoin Stratum V1 client (subscribe / authorize / notify / submit) |
+| `Makefile` | Build / clean / metrics / testnet |
 | `measure.sh` | Optional energy sample via `powermetrics` (needs sudo) |
 | `README.md` | This file |
 
@@ -20,10 +21,37 @@ Requires `as`/`clang` with `-arch arm64` (Xcode Command Line Tools).
 
 ```sh
 make                 # builds miner_test
-./miner_test         # self-test + timed batch
+./miner_test         # self-test + timed batch (default)
 ./miner_test 5000000 # custom nonce count for H/s
 make clean
 ```
+
+## Bitcoin testnet mining (Stratum)
+
+Connects to a **public testnet3** Stratum, builds headers from `mining.notify`, hashes with the asm midstate path, and submits shares.
+
+```sh
+# BTCLab testnet3 (default). Username must be a tb1… address (`.` is rejected).
+# Uses a built-in throwaway mining-only address + mining.suggest_difficulty 0.001
+# so a CPU can prove an accepted share in seconds.
+make testnet
+# or:
+./miner_test --testnet --seconds 90 --max-shares 1
+
+# Custom endpoint / user:
+./miner_test --stratum tn3.btclab.dev:3333 \
+  --user tb1q… --pass x --suggest-diff 0.001 --seconds 120
+```
+
+**Notes**
+
+- Default endpoint: `stratum+tcp://tn3.btclab.dev:3333` (bare TCP, no TLS).
+- BTCLab docs mention user `.` / pass `x`; in practice authorize requires a real `tb1…` address. A throwaway testnet address is fine for mining-only.
+- Default mining username is throwaway testnet P2WPKH `tb1qhpe5prj25dsaxjnhq0ukj689xrcy8ede76p2up` (mining-only; not a savings wallet).
+- Fallback pool `testnet3.solopool.com:3332` also accepts `tb1…` (and honors `mining.suggest_difficulty`).
+- Default pool difficulty without suggest is often **16384** (~weeks at ~25 MH/s). Always pass `--suggest-diff` for CPU education runs.
+- Hash path stays **pure asm**; C does Stratum, merkle/header setup, and share-target checks.
+- Live session note: notify parsing must fully skip long `coinb1`/`coinb2` strings before reading `version`/`nbits`/`ntime` (truncated scan previously left ntime empty → pool “Difficulty too low”).
 
 ## Metrics
 
@@ -34,22 +62,13 @@ make metrics
 # or: ./miner_test --metrics
 ```
 
-Prints:
+Prints `.text` size, `ASM_H/s`, `CC_H/s`, and easy-target `TTFN_S`.
 
-1. **`.text` size** of `sha256d_mine.o` (`TEXT_SIZE_BYTES=…`)
-2. **`ASM_H/s`** — dual-lane midstate miner throughput
-3. **`CC_H/s`** — CommonCrypto `CC_SHA256`×2 baseline on the same 80-byte header work
-4. **`TTFN_S`** — wall time to first nonce under a documented fake easy target  
-   (`(digest[7] & 0xff000000) == 0`, ~1/256; not real nBits)
-
-**Optional energy** (needs passwordless or interactive sudo for `powermetrics`):
+**Optional energy** (needs sudo for `powermetrics`):
 
 ```sh
 ./measure.sh
-./measure.sh 2000000
 ```
-
-If sudo/powermetrics is unavailable, the script still runs the binary and skips energy.
 
 ## What the asm exports
 
@@ -59,23 +78,8 @@ If sudo/powermetrics is unavailable, the script still runs the binary and skips 
 | `_sha256d_genesis_selftest` | FIPS "abc" + genesis midstate mine; `0` = PASS |
 | `_sha256d_mine_midstate` | Dual-lane midstate loop, K-window staging, nonce splice, digest compare |
 
-## Design notes (v1 + items 2–3)
-
-**In `.s`:**
-
-- **K staging:** `LK256` in `__TEXT,__const`; 4-vector sliding window in `v28–v31`, reloaded every 4 round-groups
-- **Dual-lane:** two nonces interleaved to hide SHA256H latency
-- Pre-REV32 fixed block1 words; nonce-only W3 splice; odd leftover = single-lane K-staged path
-- **Second-SHA:** fixed pad W8–W15 + IV cached; full W16+ pre-extend is not valid (digest-dependent). Amortizations: K0–15 reload overlapped with midstate adds; rounds 8–15 shared pad+K WK; skip no-op `sha256su0` at W24–27 when W8–11 are zero/pad
-
-## Test vector
-
-Genesis header → SHA-256d internal LE digest  
-`6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000`  
-(display byte-reversed `000000000019d668…`).
-
 ## Constraints
 
 - Hash path is **pure ARM64 assembly** — no C in the hash path
-- C is only the harness (tests, timing, metrics glue)
-- **No pools / Stratum / networking**
+- C is harness + Stratum only
+- **No mainnet pools / AntPool / paid mining**
