@@ -1,0 +1,17 @@
+# Build artifacts
+*.o
+miner_test
+*.dSYM/
+
+# macOS
+.DS_Store
+
+# Editor / IDE
+*.swp
+*~
+.idea/
+.vscode/
+
+# Misc binaries / local junk
+a.out
+*.out
