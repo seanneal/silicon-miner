@@ -23,8 +23,21 @@ Requires `as`/`clang` with `-arch arm64` (Xcode Command Line Tools).
 make                 # builds miner_test
 ./miner_test         # self-test + timed batch (default)
 ./miner_test 5000000 # custom nonce count for H/s
+./miner_test --threads 4 5000000
 make clean
 ```
+
+## Threads
+
+`--threads N` splits a nonce span across N workers in C. Each worker calls `_sha256d_mine_midstate` on a disjoint range (even slices, so the asm stays on the dual-lane path). `N=1` is the original single call.
+
+Default N is `hw.perflevel0.physicalcpu` (Apple Silicon performance cores), then `hw.ncpu`, then `sysconf(_SC_NPROCESSORS_ONLN)`. Each worker sets the same `QOS_CLASS_USER_INTERACTIVE` hint as the main thread.
+
+Timing, `--metrics`, and the testnet loop all take `--threads`. Stratum share checks are a target inequality, so that search uses the same partition but hashes each slice with the existing asm compress (`sha256_compress` via `sha256d_asm_one`). The equality-gated dual-lane probe in the testnet loop is also multi-threaded. `--metrics` prints `THREADS` and `ASM_H/s`.
+
+## Linux check (not an M1 bench)
+
+The hash path is Mach-O and uses Apple `@PAGE` syntax. On Linux, `make` rewrites that syntax to ELF, cross-assembles with `aarch64-linux-gnu-gcc`, and runs under `qemu-aarch64-static -cpu max`. Self-test must pass. Any H/s from that run is qemu, not Apple Silicon.
 
 ## Bitcoin testnet mining (Stratum)
 
@@ -36,7 +49,7 @@ Connects to a **public testnet3** Stratum, builds headers from `mining.notify`, 
 # so a CPU can prove an accepted share in seconds.
 make testnet
 # or:
-./miner_test --testnet --seconds 90 --max-shares 1
+./miner_test --testnet --seconds 90 --max-shares 1 --threads 4
 
 # Custom endpoint / user:
 ./miner_test --stratum tn3.btclab.dev:3333 \
@@ -62,7 +75,7 @@ make metrics
 # or: ./miner_test --metrics
 ```
 
-Prints `.text` size, `ASM_H/s`, `CC_H/s`, and easy-target `TTFN_S`.
+Prints `.text` size, `THREADS`, `ASM_H/s`, `CC_H/s`, and easy-target `TTFN_S`.
 
 **Optional energy** (needs sudo for `powermetrics`):
 

@@ -1,6 +1,8 @@
 # Build artifacts
 *.o
 miner_test
+miner_test.aarch64
+sha256d_mine.elf.s
 *.dSYM/
 
 # macOS
