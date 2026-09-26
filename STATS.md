@@ -149,3 +149,11 @@ Keep the machine awake for long runs (`caffeinate -dims` or equivalent).
 ---
 
 *Append new rows when benches or soaks land; prefer exact harness/`measure.sh` fields over rounded chat summaries.*
+
+---
+
+## 9. TIME_SPLIT (wall accounting)
+
+The timed batch, `--soak`, and the testnet summary now print `TIME_SPLIT`, `TIME_SPLIT_PCT`, `TIME_SPLIT_CPU`, `TIME_SPLIT_FLIGHT`, `TIME_SPLIT_OVERLAP`, and `TIME_SPLIT_CLOCK`. How to read them is in the README section "Reading TIME_SPLIT".
+
+Unmeasured on MacBookPro18,3 until an offline soak and a testnet soak are re-run on that machine. This note does not add H/s figures. The 2026-09-26 offline and live numbers above stand until that re-run.

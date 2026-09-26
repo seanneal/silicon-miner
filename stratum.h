@@ -61,6 +61,10 @@ typedef struct {
         uint32_t nonce;
     } submit_slot[STRATUM_SUBMIT_SLOTS];
     int      submit_pending;
+    /* stratum_poll split. wait = blocked in select; busy = recv + JSON.
+     * Main thread only. Durations use mono_clock.h. */
+    uint64_t poll_wait_ns;
+    uint64_t poll_busy_ns;
 } stratum_client_t;
 
 /* Connect host:port, subscribe, optional suggest_diff, authorize. */

@@ -3,6 +3,7 @@
  * stratum.c — Bitcoin Stratum V1 over bare TCP (educational testnet miner)
  */
 #include "stratum.h"
+#include "mono_clock.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -531,6 +532,9 @@ static void handle_line(stratum_client_t *c, const char *line) {
 
 int stratum_poll(stratum_client_t *c, int timeout_ms) {
     if (c->fd < 0) return -1;
+    /* Select wait is not JSON work. Callers that print TIME_SPLIT can keep
+     * the two counters apart (a timeout must not look like notify parsing). */
+    uint64_t t0 = mono_ns();
     fd_set rfds;
     FD_ZERO(&rfds);
     FD_SET(c->fd, &rfds);
@@ -538,38 +542,46 @@ int stratum_poll(stratum_client_t *c, int timeout_ms) {
     tv.tv_sec = timeout_ms / 1000;
     tv.tv_usec = (timeout_ms % 1000) * 1000;
     int rv = select(c->fd + 1, &rfds, NULL, NULL, &tv);
+    c->poll_wait_ns += mono_ns() - t0;
     if (rv < 0) {
         if (errno == EINTR) return 0;
         return -1;
     }
     if (rv == 0) return 0;
+
+    t0 = mono_ns();
+    int rc = 1;
     char tmp[4096];
     ssize_t n = recv(c->fd, tmp, sizeof tmp, 0);
-    if (n == 0) return -1;
-    if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
-        return -1;
-    }
-    if (c->rx_len + (size_t)n >= sizeof c->rx) {
-        /* overflow — reset */
-        c->rx_len = 0;
-    }
-    memcpy(c->rx + c->rx_len, tmp, (size_t)n);
-    c->rx_len += (size_t)n;
-    c->rx[c->rx_len] = '\0';
+    if (n == 0) {
+        rc = -1;
+    } else if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) rc = 0;
+        else rc = -1;
+    } else {
+        if (c->rx_len + (size_t)n >= sizeof c->rx) {
+            /* overflow — reset */
+            c->rx_len = 0;
+        }
+        memcpy(c->rx + c->rx_len, tmp, (size_t)n);
+        c->rx_len += (size_t)n;
+        c->rx[c->rx_len] = '\0';
 
-    char *start = c->rx;
-    char *nl;
-    while ((nl = strchr(start, '\n')) != NULL) {
-        *nl = '\0';
-        if (nl > start && nl[-1] == '\r') nl[-1] = '\0';
-        if (*start) handle_line(c, start);
-        start = nl + 1;
+        char *start = c->rx;
+        char *nl;
+        while ((nl = strchr(start, '\n')) != NULL) {
+            *nl = '\0';
+            if (nl > start && nl[-1] == '\r') nl[-1] = '\0';
+            if (*start) handle_line(c, start);
+            start = nl + 1;
+        }
+        size_t rem = strlen(start);
+        memmove(c->rx, start, rem + 1);
+        c->rx_len = rem;
+        rc = 1;
     }
-    size_t rem = strlen(start);
-    memmove(c->rx, start, rem + 1);
-    c->rx_len = rem;
-    return 1;
+    c->poll_busy_ns += mono_ns() - t0;
+    return rc;
 }
 
 static int wait_reply(stratum_client_t *c, int id, int timeout_ms) {
