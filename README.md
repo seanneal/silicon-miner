@@ -113,9 +113,27 @@ The default timed batch, `--soak`, and the testnet summary print where the wall 
 | `poll_s` | Main-thread `stratum_poll` while no batch is running (stalls the next hash) |
 | `midstate_s` | Header and midstate build while no batch is running |
 | `submit_s` | Share enqueue plus `mining.submit` writes while no batch is running |
-| `other_s` | Remainder of the wall clock: status lines, thread join gaps, and the end-of-run wait for pool replies |
+| `other_s` | Remainder of the wall clock. `TIME_SPLIT_GAPS` splits this remainder; it is not renamed away |
 
-`TIME_SPLIT_OVERLAP` is poll, midstate build, and submit that ran **while a batch was hashing**. That time is concurrent with `hash_s`, so it stays off the 100% line. `poll_busy_s` is recv plus JSON. `poll_wait_s` is time blocked in `select`. A large `poll_wait_s` with a small `poll_s` means the socket wait overlapped hashing and did not stall it.
+`TIME_SPLIT_GAPS` is that remainder, in the same clock. The seven fields sum to `other_s`, so together with `hash` / `share` / `poll` / `midstate` / `submit` they add to 100% of elapsed wall (`TIME_SPLIT_GAPS_PCT`).
+
+| Field | Counts |
+|-------|--------|
+| `batch_setup_s` | From deciding to start a batch until the **first** worker is about to enter the hash loop (nonce split, `pthread_create`, pin). Later workers' spawn delay overlaps that first worker and stays inside `flight_s` |
+| `teardown_s` | From the **last** worker leaving the hash loop until `pthread_join` has collected results, plus full-batch bookkeeping before the next start. Includes the main thread still blocked in `select` after workers have already stopped |
+| `share_restart_s` | Extra wall after that join when a share hit rebuilds on a new extranonce2. Header build and submit writes already in `midstate_s` / `submit_s` are not counted again |
+| `cancel_restart_s` | Extra wall after that join when `clean_jobs` / cancel resumes work |
+| `end_drain_s` | `stratum_submit_drain` after hashing has stopped (pool reply wait) |
+| `status_s` | STATUS / soak printf while no batch is in flight |
+| `unexplained_s` | Residual of `other_s` |
+
+A share stops **only that worker's slice**. The batch's flight wall is still the slowest slice. `early_share` means the batch hashed fewer nonces than it was assigned because at least one slice stopped on a share. It does not mean every worker aborted. `early_clean` means `clean_jobs` or end-of-run cancel stopped the batch short of its assignment. `full` finished the assignment.
+
+`TIME_SPLIT_GAPS_DETAIL` splits the join-side part of `teardown_s` (not an extra percentage): `wake_s` is from the last worker's exit until the main thread notices the batch is done (the poll tail); `join_s` is `pthread_join` after that. `wake_s + join_s` is that join-side teardown, not the post-join bookkeeping also folded into `teardown_s`.
+
+`BATCHES` counts starts and how they ended, plus `avg_flight_s` (flight wall / flights) and `hashes_per_flight`.
+
+`TIME_SPLIT_OVERLAP` is poll, midstate build, and submit that ran **while a batch was hashing**. That time is concurrent with `hash_s`, so it stays off the 100% line. `poll_busy_s` is recv plus JSON. `poll_wait_s` is time blocked in `select`. A large `poll_wait_s` with a small `poll_s` means the socket wait overlapped hashing and did not stall it. A poll that runs past the last worker's exit is still entirely in `poll_wait_s`; the post-exit tail is also in `teardown_s` / `wake_s`.
 
 `TIME_SPLIT_CPU` sums per-slice CPU time. `hash_s` there grows with thread count and can exceed the wall clock. `TIME_SPLIT_FLIGHT` is the in-flight wall before the hash/share/submit split.
 
