@@ -115,6 +115,7 @@ Landed on `main` (PR #1 squash merge `86fe9cf`, 2026-09-26). TIME_SPLIT accounti
 | — | Multi-thread C nonce ranges | eng | Done / on main |
 | — | Dual-lane asm schedule | eng | Done / on main |
 | — | TIME_SPLIT wall accounting | eng | Done / on main (PR #3); Mac live soak in section 9 |
+| — | TIME_SPLIT_GAPS (split `other`) | eng | Implemented; Mac soak pending (section 10) |
 | E1 | P-core pin (`--pin` / `--no-pin`) | eng | Done / exercised on Mac |
 | E2 | Offline `--soak` | eng | Done |
 | E3 | Multi-thread `measure.sh` | eng | Done (MT peak watts TBD) |
@@ -190,3 +191,26 @@ TIME_SPLIT_CLOCK=mach_absolute_time*mach_timebase_info
 Same-build offline timed batch (comparison only): ~84.3 MH/s @ 6T (`H/s=84285052` on 2M nonces).
 
 **Interpretation:** poll/midstate/submit idle-path ≈0%; share-check ~6% wall; ~33% wall still in other (batch gaps / unlabeled).
+
+`TIME_SPLIT_GAPS` now names that remainder (setup, teardown, share restart, cancel restart, end drain, status, unexplained). Mac numbers for those fields are not in this section — see section 10.
+
+---
+
+## 10. TIME_SPLIT_GAPS (other split)
+
+Implemented on top of section 9. The harness prints `TIME_SPLIT_GAPS`, `TIME_SPLIT_GAPS_PCT`, `TIME_SPLIT_GAPS_DETAIL`, and `BATCHES` with the existing `TIME_SPLIT` lines (timed batch, `--soak`, and the testnet summary). How to read them is in the README section "Reading TIME_SPLIT".
+
+The new fields partition `other_s`. They do not rename `TIME_SPLIT` / `TIME_SPLIT_PCT` / `TIME_SPLIT_CPU` / `TIME_SPLIT_FLIGHT` / `TIME_SPLIT_OVERLAP`.
+
+**Mac live soak for these counters is pending.** Do not reuse section 9's `other_s=39.1821` as a fill-in for `batch_setup_s` / `teardown_s` / the other named gaps. Re-run on MacBookPro18,3 and append the harness lines here.
+
+```sh
+caffeinate -dims ./miner_test --testnet --seconds 120 --max-shares 0 --threads 6 --suggest-diff 0.001
+```
+
+Offline comparison on the same build (not a substitute for the live gap split):
+
+```sh
+./miner_test --threads 6 2000000
+./miner_test --soak 120 --threads 6 --report 2
+```

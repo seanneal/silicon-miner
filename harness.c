@@ -131,12 +131,28 @@ static double monotonic_seconds(void) {
  *     flight, split by that batch's CPU ticks (asm vs C check vs enqueue).
  *   poll_s, midstate_s, submit_s (main-thread writes) = work done while
  *     no batch was in flight, so it stalls the next hash.
- *   other_s = the rest of the wall clock (status lines, select after the
- *     workers have already finished, pool-reply drain).
+ *   other_s = the rest of the wall clock.
+ *
+ * TIME_SPLIT_GAPS partitions other_s (same clock). Those fields plus the
+ * non-other TIME_SPLIT buckets sum to elapsed wall. unexplained_s is the
+ * residual. Flight is [first worker t_start, last worker t_end]. The gap
+ * flight_s << elapsed_s is everything outside those intervals:
+ *   batch_setup_s  — decide to start a batch until the first worker is
+ *                    about to enter the hash loop (range split, spawn, pin)
+ *   teardown_s     — last worker left the hash loop until join has collected
+ *                    results, plus full-batch bookkeeping before the next
+ *                    start. Includes the main thread still blocked in poll
+ *                    after workers have already stopped.
+ *   share_restart_s — extra wall after that join when a share hit restarts
+ *                    on a new extranonce2 (stall midstate/submit removed)
+ *   cancel_restart_s — same, when clean_jobs / cancel resumes work
+ *   end_drain_s    — stratum_submit_drain after hashing has stopped
+ *   status_s       — status/soak printf while no batch is in flight
  *
  * TIME_SPLIT_OVERLAP is main-thread poll / midstate / submit that ran
  * while a batch was in flight. It is concurrent with hash and is not
- * part of the 100% line.
+ * part of the 100% line. A poll that straddles worker exit still lands
+ * entirely in OVERLAP; the post-exit tail is also in teardown_s.
  *
  * TIME_SPLIT_CPU is the sum across threads (hash can exceed wall).
  *
@@ -161,6 +177,34 @@ static uint64_t g_overlap_submit_ns;
 static uint64_t g_scan_slices_timed;
 /* Main thread only. Set while a testnet scan batch is running. */
 static int g_in_flight;
+
+/*
+ * Gap buckets are main-thread only (workers publish t_start_ns / t_end_ns;
+ * the main thread reads them after join). No lock on the nonce loop.
+ * wake_s + join_s split the join-side part of teardown; they are not added
+ * again on the 100% line.
+ */
+static uint64_t g_gap_setup_ns;
+static uint64_t g_gap_teardown_ns;
+static uint64_t g_gap_share_restart_ns;
+static uint64_t g_gap_cancel_restart_ns;
+static uint64_t g_gap_end_drain_ns;
+static uint64_t g_gap_status_ns;
+static uint64_t g_gap_wake_ns;
+static uint64_t g_gap_join_ns;
+static uint64_t g_batches_started;
+static uint64_t g_batches_early_share;
+static uint64_t g_batches_early_clean;
+static uint64_t g_batches_full;
+static uint64_t g_flight_spans;
+static uint64_t g_flight_hashes;
+
+/* Open across the post-join restart block in the testnet loop. Main thread. */
+static int g_restart_open;
+static uint64_t g_restart_t0;
+static uint64_t g_restart_mid0;
+static uint64_t g_restart_sub0;
+static uint64_t g_restart_poll0;
 
 static int time_split_on(void) {
     return atomic_load_explicit(&g_time_split_on, memory_order_acquire);
@@ -206,6 +250,21 @@ static void time_split_reset(void) {
     g_overlap_submit_ns = 0;
     g_scan_slices_timed = 0;
     g_in_flight = 0;
+    g_gap_setup_ns = 0;
+    g_gap_teardown_ns = 0;
+    g_gap_share_restart_ns = 0;
+    g_gap_cancel_restart_ns = 0;
+    g_gap_end_drain_ns = 0;
+    g_gap_status_ns = 0;
+    g_gap_wake_ns = 0;
+    g_gap_join_ns = 0;
+    g_batches_started = 0;
+    g_batches_early_share = 0;
+    g_batches_early_clean = 0;
+    g_batches_full = 0;
+    g_flight_spans = 0;
+    g_flight_hashes = 0;
+    g_restart_open = 0;
     atomic_store_explicit(&g_time_split_on, 1, memory_order_release);
 }
 
@@ -223,6 +282,87 @@ static void account_submit_ns(uint64_t dt) {
     if (!time_split_on()) return;
     if (g_in_flight) g_overlap_submit_ns += dt;
     else g_stall_submit_ns += dt;
+}
+
+static void add_flight_wall(uint64_t lo, uint64_t hi) {
+    if (hi > lo) {
+        g_flight_wall_ns += hi - lo;
+        g_flight_spans++;
+    }
+}
+
+/* Exclusive pre-flight setup and post-flight join. have_notice splits the
+ * tail into poll-wake (workers already stopped, main has not joined yet)
+ * and pthread_join. Both are inside teardown_s. */
+static void gap_add_batch_edges(uint64_t t_decide, uint64_t t_after,
+                                uint64_t lo, uint64_t hi,
+                                uint64_t t_notice, int have_notice) {
+    if (!time_split_on()) return;
+    if (t_decide && lo != UINT64_MAX && hi >= lo && lo > t_decide)
+        g_gap_setup_ns += lo - t_decide;
+    if (!t_after || hi == 0 || lo == UINT64_MAX || t_after <= hi) return;
+    uint64_t tail = t_after - hi;
+    g_gap_teardown_ns += tail;
+    if (have_notice && t_notice > hi) {
+        g_gap_wake_ns += t_notice - hi;
+        if (t_after > t_notice)
+            g_gap_join_ns += t_after - t_notice;
+    } else {
+        g_gap_join_ns += tail;
+    }
+}
+
+static void batch_count_begin(void) {
+    if (time_split_on()) g_batches_started++;
+}
+
+/* early_clean wins over early_share. A full nonce assignment is full even
+ * if a share landed on the last nonce. */
+static void batch_count_end(int early_share, int early_clean) {
+    if (!time_split_on()) return;
+    if (early_clean) g_batches_early_clean++;
+    else if (early_share) g_batches_early_share++;
+    else g_batches_full++;
+}
+
+static void restart_window_open(void) {
+    if (!time_split_on()) {
+        g_restart_open = 0;
+        return;
+    }
+    g_restart_t0 = mono_ns();
+    g_restart_mid0 = g_stall_mid_ns;
+    g_restart_sub0 = g_stall_submit_ns;
+    g_restart_poll0 = g_stall_poll_ns;
+    g_restart_open = 1;
+}
+
+/* kind: 0 full-batch bookkeeping (folded into teardown), 1 share, 2 cancel.
+ * Stall poll/mid/submit inside the window stays in those buckets. */
+static void restart_window_close(int kind) {
+    if (!g_restart_open) return;
+    g_restart_open = 0;
+    uint64_t t1 = mono_ns();
+    uint64_t dt = t1 > g_restart_t0 ? t1 - g_restart_t0 : 0;
+    uint64_t stall = (g_stall_mid_ns - g_restart_mid0)
+                   + (g_stall_submit_ns - g_restart_sub0)
+                   + (g_stall_poll_ns - g_restart_poll0);
+    uint64_t gap = dt > stall ? dt - stall : 0;
+    if (gap == 0) return;
+    if (kind == 1) g_gap_share_restart_ns += gap;
+    else if (kind == 2) g_gap_cancel_restart_ns += gap;
+    else g_gap_teardown_ns += gap;
+}
+
+static void status_account_begin(uint64_t *t0, int *on) {
+    *on = time_split_on() && !g_in_flight;
+    *t0 = *on ? mono_ns() : 0;
+}
+
+static void status_account_end(uint64_t t0, int on) {
+    if (!on || !t0) return;
+    uint64_t t1 = mono_ns();
+    if (t1 > t0) g_gap_status_ns += t1 - t0;
 }
 
 static double ns_to_s(uint64_t ns) {
@@ -286,6 +426,62 @@ static void time_split_print(double wall_s) {
            ns_to_s(g_overlap_poll_busy_ns), ns_to_s(g_overlap_poll_wait_ns),
            ns_to_s(g_overlap_mid_ns), ns_to_s(g_overlap_submit_ns));
     printf("TIME_SPLIT_CLOCK=%s\n", mono_clock_name());
+
+    double setup_s = ns_to_s(g_gap_setup_ns);
+    double teardown_s = ns_to_s(g_gap_teardown_ns);
+    double share_restart_s = ns_to_s(g_gap_share_restart_ns);
+    double cancel_restart_s = ns_to_s(g_gap_cancel_restart_ns);
+    double end_drain_s = ns_to_s(g_gap_end_drain_ns);
+    double status_s = ns_to_s(g_gap_status_ns);
+    double named = setup_s + teardown_s + share_restart_s + cancel_restart_s
+                 + end_drain_s + status_s;
+    double unexplained_s = other_s - named;
+    if (unexplained_s < 0.0) {
+        /* Mono vs CLOCK_MONOTONIC sliver. Trim the largest gap so this line
+         * still partitions other_s and the percentages add to 100. */
+        double overflow = -unexplained_s;
+        double *parts[6] = {
+            &setup_s, &teardown_s, &share_restart_s,
+            &cancel_restart_s, &end_drain_s, &status_s
+        };
+        for (int n = 0; n < 6 && overflow > 1e-12; n++) {
+            int k = 0;
+            for (int i = 1; i < 6; i++)
+                if (*parts[i] > *parts[k]) k = i;
+            double cut = *parts[k] < overflow ? *parts[k] : overflow;
+            *parts[k] -= cut;
+            overflow -= cut;
+            if (*parts[k] <= 0.0 && cut <= 0.0) break;
+        }
+        unexplained_s = other_s - (setup_s + teardown_s + share_restart_s
+                                   + cancel_restart_s + end_drain_s + status_s);
+        if (unexplained_s < 0.0) unexplained_s = 0.0;
+    }
+
+    printf("TIME_SPLIT_GAPS batch_setup_s=%.4f teardown_s=%.4f share_restart_s=%.4f "
+           "cancel_restart_s=%.4f end_drain_s=%.4f status_s=%.4f unexplained_s=%.4f\n",
+           setup_s, teardown_s, share_restart_s, cancel_restart_s,
+           end_drain_s, status_s, unexplained_s);
+    printf("TIME_SPLIT_GAPS_PCT batch_setup=%.2f teardown=%.2f share_restart=%.2f "
+           "cancel_restart=%.2f end_drain=%.2f status=%.2f unexplained=%.2f\n",
+           setup_s * pct, teardown_s * pct, share_restart_s * pct,
+           cancel_restart_s * pct, end_drain_s * pct, status_s * pct,
+           unexplained_s * pct);
+    printf("TIME_SPLIT_GAPS_DETAIL wake_s=%.4f join_s=%.4f\n",
+           ns_to_s(g_gap_wake_ns), ns_to_s(g_gap_join_ns));
+    {
+        double avg_flight = g_flight_spans ? flight / (double)g_flight_spans : 0.0;
+        double hpf = g_batches_started
+                         ? (double)g_flight_hashes / (double)g_batches_started
+                         : 0.0;
+        printf("BATCHES started=%llu early_share=%llu early_clean=%llu full=%llu "
+               "avg_flight_s=%.4f hashes_per_flight=%.0f\n",
+               (unsigned long long)g_batches_started,
+               (unsigned long long)g_batches_early_share,
+               (unsigned long long)g_batches_early_clean,
+               (unsigned long long)g_batches_full,
+               avg_flight, hpf);
+    }
 }
 
 /*
@@ -667,37 +863,53 @@ static int earlier_hit(int any, uint32_t best_off, uint32_t start, uint32_t foun
     return (uint32_t)(found - start) < best_off;
 }
 
-static void account_mine_slices(const mine_slice_t *s, int n) {
-    if (!time_split_on() || n < 1) return;
+static void account_mine_slices(const mine_slice_t *s, int n,
+                                uint64_t *lo_out, uint64_t *hi_out) {
     uint64_t lo = UINT64_MAX;
     uint64_t hi = 0;
     int any = 0;
-    for (int i = 0; i < n; i++) {
-        if (!s[i].timed) continue;
-        any = 1;
-        if (s[i].t_start_ns < lo) lo = s[i].t_start_ns;
-        if (s[i].t_end_ns > hi) hi = s[i].t_end_ns;
-        g_cpu_hash_ticks += s[i].hash_ticks;
+    if (time_split_on() && n >= 1) {
+        for (int i = 0; i < n; i++) {
+            if (!s[i].timed) continue;
+            any = 1;
+            if (s[i].t_start_ns < lo) lo = s[i].t_start_ns;
+            if (s[i].t_end_ns > hi) hi = s[i].t_end_ns;
+            g_cpu_hash_ticks += s[i].hash_ticks;
+        }
+        if (any) add_flight_wall(lo, hi);
     }
-    if (any && hi > lo) g_flight_wall_ns += hi - lo;
+    if (!any) {
+        lo = UINT64_MAX;
+        hi = 0;
+    }
+    if (lo_out) *lo_out = lo;
+    if (hi_out) *hi_out = hi;
 }
 
-static void account_scan_slices(const scan_slice_t *s, int n) {
-    if (!time_split_on() || n < 1) return;
+static void account_scan_slices(const scan_slice_t *s, int n,
+                                uint64_t *lo_out, uint64_t *hi_out) {
     uint64_t lo = UINT64_MAX;
     uint64_t hi = 0;
     int any = 0;
-    for (int i = 0; i < n; i++) {
-        if (!s[i].timed) continue;
-        any = 1;
-        g_scan_slices_timed++;
-        if (s[i].t_start_ns < lo) lo = s[i].t_start_ns;
-        if (s[i].t_end_ns > hi) hi = s[i].t_end_ns;
-        g_cpu_hash_ticks += s[i].hash_ticks;
-        g_cpu_share_ticks += s[i].share_ticks;
-        g_cpu_submit_ticks += s[i].submit_ticks;
+    if (time_split_on() && n >= 1) {
+        for (int i = 0; i < n; i++) {
+            if (!s[i].timed) continue;
+            any = 1;
+            g_scan_slices_timed++;
+            if (s[i].t_start_ns < lo) lo = s[i].t_start_ns;
+            if (s[i].t_end_ns > hi) hi = s[i].t_end_ns;
+            g_cpu_hash_ticks += s[i].hash_ticks;
+            g_cpu_share_ticks += s[i].share_ticks;
+            g_cpu_submit_ticks += s[i].submit_ticks;
+        }
+        if (any) add_flight_wall(lo, hi);
     }
-    if (any && hi > lo) g_flight_wall_ns += hi - lo;
+    if (!any) {
+        lo = UINT64_MAX;
+        hi = 0;
+    }
+    if (lo_out) *lo_out = lo;
+    if (hi_out) *hi_out = hi;
 }
 
 /*
@@ -710,6 +922,7 @@ static int mine_midstate_n(const uint32_t mid[8], const uint32_t w_be[16],
                            const uint32_t expect[8], uint32_t *found_nonce,
                            int threads) {
     if (nonce_count == 0) return 0;
+    uint64_t t_decide = time_split_on() ? mono_ns() : 0;
     threads = clamp_threads(threads);
 
     uint32_t starts[MAX_MINE_THREADS];
@@ -721,13 +934,18 @@ static int mine_midstate_n(const uint32_t mid[8], const uint32_t w_be[16],
             return sha256d_mine_midstate(mid, w_be, nonce_start, nonce_count,
                                          expect, found_nonce);
         }
+        batch_count_begin();
         uint64_t t_start = mono_ns();
         uint64_t a = mono_ticks();
         int hit = sha256d_mine_midstate(mid, w_be, nonce_start, nonce_count,
                                         expect, found_nonce);
         g_cpu_hash_ticks += mono_ticks() - a;
         uint64_t t_end = mono_ns();
-        if (t_end > t_start) g_flight_wall_ns += t_end - t_start;
+        add_flight_wall(t_start, t_end);
+        uint64_t t_after = mono_ns();
+        gap_add_batch_edges(t_decide, t_after, t_start, t_end, 0, 0);
+        g_flight_hashes += nonce_count;
+        batch_count_end(0, 0);
         return hit;
     }
 
@@ -746,8 +964,16 @@ static int mine_midstate_n(const uint32_t mid[8], const uint32_t w_be[16],
         slices[i].t_end_ns = 0;
         slices[i].hash_ticks = 0;
     }
+    batch_count_begin();
     run_workers(used, mine_slice_worker, slices, sizeof slices[0]);
-    account_mine_slices(slices, used);
+    uint64_t t_after = time_split_on() ? mono_ns() : 0;
+    uint64_t lo = UINT64_MAX, hi = 0;
+    account_mine_slices(slices, used, &lo, &hi);
+    gap_add_batch_edges(t_decide, t_after, lo, hi, 0, 0);
+    if (time_split_on()) {
+        g_flight_hashes += nonce_count;
+        batch_count_end(0, 0);
+    }
 
     int any = 0;
     uint32_t best = 0;
@@ -779,6 +1005,7 @@ static scan_result_t scan_share_n(const uint32_t mid[8], const uint32_t w_be[16]
     r.nonce = 0;
     r.hashes = 0;
     if (nonce_count == 0) return r;
+    uint64_t t_decide = time_split_on() ? mono_ns() : 0;
     threads = clamp_threads(threads);
 
     uint32_t starts[MAX_MINE_THREADS];
@@ -807,12 +1034,16 @@ static scan_result_t scan_share_n(const uint32_t mid[8], const uint32_t w_be[16]
         slices[i].share_ticks = 0;
         slices[i].submit_ticks = 0;
     }
+    batch_count_begin();
     if (used <= 1) {
         scan_slice_worker(&slices[0]);
     } else {
         run_workers(used, scan_slice_worker, slices, sizeof slices[0]);
     }
-    account_scan_slices(slices, used);
+    uint64_t t_after = time_split_on() ? mono_ns() : 0;
+    uint64_t lo = UINT64_MAX, hi = 0;
+    account_scan_slices(slices, used, &lo, &hi);
+    gap_add_batch_edges(t_decide, t_after, lo, hi, 0, 0);
 
     uint32_t best_off = 0;
     for (int i = 0; i < used; i++) {
@@ -823,6 +1054,13 @@ static scan_result_t scan_share_n(const uint32_t mid[8], const uint32_t w_be[16]
             r.nonce = slices[i].found;
             best_off = slices[i].found - nonce_start;
         }
+    }
+    if (time_split_on()) {
+        g_flight_hashes += r.hashes;
+        /* A share stops only that slice. The batch is "early" when the
+         * assignment was not fully hashed. No separate restart gap here:
+         * the caller returns. Testnet restart time is measured in the loop. */
+        batch_count_end(r.hit && r.hashes < nonce_count, 0);
     }
     return r;
 }
@@ -1107,6 +1345,19 @@ static int run_selftest(int threads) {
         return 1;
     }
     printf("SELFTEST: TIME_SPLIT counters armed\n");
+    if (g_gap_setup_ns == 0 || g_gap_teardown_ns == 0 ||
+        g_batches_started == 0 || g_batches_full == 0 ||
+        g_batches_early_share == 0) {
+        printf("SELFTEST: FAIL (TIME_SPLIT_GAPS empty setup_ns=%llu teardown_ns=%llu "
+               "started=%llu full=%llu early_share=%llu)\n",
+               (unsigned long long)g_gap_setup_ns,
+               (unsigned long long)g_gap_teardown_ns,
+               (unsigned long long)g_batches_started,
+               (unsigned long long)g_batches_full,
+               (unsigned long long)g_batches_early_share);
+        return 1;
+    }
+    printf("SELFTEST: TIME_SPLIT_GAPS counters armed\n");
     time_split_off();
     return 0;
 }
@@ -1131,6 +1382,9 @@ typedef struct {
     scan_slice_t slices[MAX_MINE_THREADS];
     int n;
     int running;
+    uint64_t t_decide_ns;
+    uint64_t t_notice_ns;
+    uint32_t assigned;
 } scan_flight_t;
 
 #define SHARE_Q 64
@@ -1238,14 +1492,31 @@ static void scan_join(scan_flight_t *f, scan_result_t *r) {
             best_off = f->slices[i].found - origin;
         }
     }
-    account_scan_slices(f->slices, f->n);
+    {
+        uint64_t lo = UINT64_MAX, hi = 0;
+        account_scan_slices(f->slices, f->n, &lo, &hi);
+        uint64_t t_after = time_split_on() ? mono_ns() : 0;
+        int have_notice = f->t_notice_ns != 0;
+        gap_add_batch_edges(f->t_decide_ns, t_after, lo, hi,
+                            f->t_notice_ns, have_notice);
+        if (time_split_on()) {
+            int abandoned = atomic_load_explicit(&g_scan_cancel, memory_order_relaxed);
+            int short_batch = f->assigned > 0 && r->hashes < f->assigned;
+            g_flight_hashes += r->hashes;
+            batch_count_end(r->hit && short_batch && !abandoned,
+                            abandoned && short_batch);
+        }
+    }
     f->running = 0;
     f->n = 0;
 }
 
 /* Background share scan. Main keeps the socket. Returns 0, or -1 if no thread. */
 static int scan_start(scan_flight_t *f, const work_buf_t *w, uint32_t count, int threads) {
+    uint64_t t_decide = time_split_on() ? mono_ns() : 0;
     memset(f, 0, sizeof *f);
+    f->t_decide_ns = t_decide;
+    f->assigned = count;
     if (!w->ready || count == 0) return -1;
     threads = clamp_threads(threads);
     uint32_t starts[MAX_MINE_THREADS];
@@ -1285,6 +1556,7 @@ static int scan_start(scan_flight_t *f, const work_buf_t *w, uint32_t count, int
     }
     f->n = used;
     f->running = 1;
+    batch_count_begin();
     return 0;
 }
 
@@ -1327,11 +1599,15 @@ static int run_soak(const uint32_t mid[8], const uint32_t w_be[16],
             double adt = now - t0;
             if (idt < 1e-9) idt = 1e-9;
             if (adt < 1e-9) adt = 1e-9;
+            uint64_t st0 = 0;
+            int st_on = 0;
+            status_account_begin(&st0, &st_on);
             printf("SOAK t=%.1f hashes=%llu H/s=%.0f H/s_avg=%.0f threads=%d\n",
                    adt, (unsigned long long)hashes,
                    (double)(hashes - hashes_mark) / idt,
                    (double)hashes / adt, threads);
             fflush(stdout);
+            status_account_end(st0, st_on);
             t_mark = now;
             hashes_mark = hashes;
         }
@@ -1466,10 +1742,16 @@ static int run_testnet(const char *host, int port, const char *user, const char 
             scan_result_t sr;
             uint32_t batch_start = active.nonce_cursor;
             int abandoned = atomic_load_explicit(&g_scan_cancel, memory_order_relaxed);
-            /* Workers have left the hash loop. Rebuilds and submits here
-             * stall the next batch, so they belong in the stall buckets. */
+            int staged_at_end = staged;
+            /* Workers have left the hash loop. t_notice is the moment the
+             * main thread sees that, so teardown can split poll-wake from join.
+             * Rebuilds and submits here stall the next batch when g_in_flight
+             * is clear, so they stay in the stall buckets. */
+            if (time_split_on())
+                flight.t_notice_ns = mono_ns();
             g_in_flight = 0;
             scan_join(&flight, &sr);
+            restart_window_open();
             hashes += sr.hashes;
             /* Hits were queued by the worker that found them, while the
              * other slices kept hashing. Flush anything still local. */
@@ -1478,6 +1760,15 @@ static int run_testnet(const char *host, int port, const char *user, const char 
                        sr.nonce, (unsigned long long)active.en2, active.job_id);
             share_q_flush(&client);
 
+            /* 2 = clean/cancel resume, 1 = share hit restarts extranonce2,
+             * 0 = full assignment or a non-clean job switch (teardown). */
+            int restart_kind = 0;
+            if (abandoned)
+                restart_kind = 2;
+            else if (sr.hit && !staged_at_end)
+                restart_kind = 1;
+
+            int leave = 0;
             if (staged) {
                 active = staging;
                 memset(&staging, 0, sizeof staging);
@@ -1494,7 +1785,7 @@ static int run_testnet(const char *host, int port, const char *user, const char 
                 uint64_t en2 = active.en2 + 1;
                 if (prepare_work(&client, &active, en2) != 0) {
                     fprintf(stderr, "STRATUM: rebuild after share failed\n");
-                    break;
+                    leave = 1;
                 }
             } else {
                 uint64_t next = (uint64_t)batch_start + sr.hashes;
@@ -1503,18 +1794,31 @@ static int run_testnet(const char *host, int port, const char *user, const char 
                  * A uint32 comparison would promote and miss the wrap. */
                 if (next >= 0x100000000ULL) {
                     uint64_t en2 = active.en2 + 1;
-                    if (prepare_work(&client, &active, en2) != 0) break;
+                    if (prepare_work(&client, &active, en2) != 0) leave = 1;
                 } else {
                     active.nonce_cursor = batch_start + (uint32_t)sr.hashes;
                     stratum_share_target(client.difficulty, active.target);
                 }
             }
 
-            now = monotonic_seconds();
-            if (g_stop) break;
-            if (seconds > 0 && (now - t0) >= (double)seconds) break;
-            if (max_shares > 0 && (int)client.shares_accepted >= max_shares) break;
-            if (!active.ready) continue;
+            if (!leave) {
+                now = monotonic_seconds();
+                if (g_stop)
+                    leave = 1;
+                else if (seconds > 0 && (now - t0) >= (double)seconds)
+                    leave = 1;
+                else if (max_shares > 0 && (int)client.shares_accepted >= max_shares)
+                    leave = 1;
+            }
+            if (leave) {
+                restart_window_close(restart_kind);
+                break;
+            }
+            if (!active.ready) {
+                restart_window_close(restart_kind);
+                continue;
+            }
+            restart_window_close(restart_kind);
             if (scan_start(&flight, &active, scan_batch, threads) != 0) {
                 fprintf(stderr, "STRATUM: scan_start failed\n");
                 break;
@@ -1526,6 +1830,9 @@ static int run_testnet(const char *host, int port, const char *user, const char 
         if (now - t_last_report >= 2.0) {
             double dt = now - t0;
             double hs = (dt > 1e-9) ? (double)hashes / dt : 0.0;
+            uint64_t st0 = 0;
+            int st_on = 0;
+            status_account_begin(&st0, &st_on);
             printf("STATUS connected=1 jobs=%llu hashes=%llu H/s=%.0f threads=%d "
                    "diff=%.8g shares_ok=%llu shares_bad=%llu pending=%d "
                    "staged_overlap=%llu en2=%llu\n",
@@ -1537,6 +1844,7 @@ static int run_testnet(const char *host, int port, const char *user, const char 
                    (unsigned long long)staged_while_hashing,
                    (unsigned long long)active.en2);
             fflush(stdout);
+            status_account_end(st0, st_on);
             t_last_report = now;
         }
     }
@@ -1544,13 +1852,21 @@ static int run_testnet(const char *host, int port, const char *user, const char 
     g_in_flight = 0;
     if (flight.running) {
         atomic_store_explicit(&g_scan_cancel, 1, memory_order_relaxed);
+        if (time_split_on())
+            flight.t_notice_ns = mono_ns();
         scan_result_t sr;
         scan_join(&flight, &sr);
         hashes += sr.hashes;
     }
     share_q_flush(&client);
-    /* Reply wait is pool RTT. It stays in other_s, not submit_s or poll_s. */
+    /* Pool RTT after hashing stopped. Named end_drain_s, not submit_s or poll_s. */
+    uint64_t drain_t0 = time_split_on() ? mono_ns() : 0;
     int pending_left = stratum_submit_drain(&client, 3000);
+    if (drain_t0) {
+        uint64_t drain_t1 = mono_ns();
+        if (drain_t1 > drain_t0)
+            g_gap_end_drain_ns += drain_t1 - drain_t0;
+    }
 
     double t1 = monotonic_seconds();
     double dt = t1 - t0;
