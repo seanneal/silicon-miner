@@ -129,7 +129,7 @@ The default timed batch, `--soak`, and the testnet summary print where the wall 
 
 A share stops **only that worker's slice**. The batch's flight wall is still the slowest slice. `early_share` means the batch hashed fewer nonces than it was assigned because at least one slice stopped on a share. It does not mean every worker aborted. `early_clean` means `clean_jobs` or end-of-run cancel stopped the batch short of its assignment. `full` finished the assignment.
 
-`TIME_SPLIT_GAPS_DETAIL` splits the join-side part of `teardown_s` (not an extra percentage): `wake_s` is from the last worker's exit until the main thread notices the batch is done (the poll tail); `join_s` is `pthread_join` after that. `wake_s + join_s` is that join-side teardown, not the post-join bookkeeping also folded into `teardown_s`.
+`TIME_SPLIT_GAPS_DETAIL` splits the join-side part of `teardown_s` (not an extra percentage): `wake_s` is from the last worker's exit until the main thread notices the batch is done; `join_s` is `pthread_join` after that. `wake_s + join_s` is that join-side teardown, not the post-join bookkeeping also folded into `teardown_s`. While a batch is in flight the main thread `select`s on the Stratum socket and a self-pipe. The last worker writes one byte after it leaves the hash loop, so that `select` returns without waiting out the poll timeout. Socket data still wakes the same `select`, which is what keeps job staging and async submit overlapped with hashing.
 
 `BATCHES` counts starts and how they ended, plus `avg_flight_s` (flight wall / flights) and `hashes_per_flight`.
 

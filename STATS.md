@@ -115,7 +115,8 @@ Landed on `main` (PR #1 squash merge `86fe9cf`, 2026-09-26). TIME_SPLIT accounti
 | — | Multi-thread C nonce ranges | eng | Done / on main |
 | — | Dual-lane asm schedule | eng | Done / on main |
 | — | TIME_SPLIT wall accounting | eng | Done / on main (PR #3); Mac live soak in section 9 |
-| — | TIME_SPLIT_GAPS (split `other`) | eng | Implemented; Mac soak pending (section 10) |
+| — | TIME_SPLIT_GAPS (split `other`) | eng | Mac soak recorded (section 10, PR #5) |
+| — | In-flight wake-on-complete | eng | This PR; Mac re-measure pending (section 10) |
 | E1 | P-core pin (`--pin` / `--no-pin`) | eng | Done / exercised on Mac |
 | E2 | Offline `--soak` | eng | Done |
 | E3 | Multi-thread `measure.sh` | eng | Done (MT peak watts TBD) |
@@ -202,7 +203,23 @@ Implemented on top of section 9. The harness prints `TIME_SPLIT_GAPS`, `TIME_SPL
 
 The new fields partition `other_s`. They do not rename `TIME_SPLIT` / `TIME_SPLIT_PCT` / `TIME_SPLIT_CPU` / `TIME_SPLIT_FLIGHT` / `TIME_SPLIT_OVERLAP`.
 
-**Mac live soak for these counters is pending.** Do not reuse section 9's `other_s=39.1821` as a fill-in for `batch_setup_s` / `teardown_s` / the other named gaps. Re-run on MacBookPro18,3 and append the harness lines here.
+### Live Stratum soak (MacBookPro18,3) — PR #5
+
+Measured 2026-09-26 on the TIME_SPLIT_GAPS build (PR #5, merged to `main`). 120 s on tn3, 6 threads. This is the pre-wake-fix soak. Do not reuse section 9's `other_s=39.1821` as these gap fields.
+
+| Field | Value |
+|-------|-------|
+| Endpoint | tn3 @ 6T |
+| Duration | **120 s** |
+| H/s | **~65 MH/s** |
+| `TIME_SPLIT_PCT` | hash=**65.11** share=**8.81** other=**26.08** |
+| `TIME_SPLIT_GAPS` | teardown=**25.94%** of wall; other named gaps ≈ 0 |
+| `TIME_SPLIT_GAPS_DETAIL` | wake_s=**31.03** join_s=**0.09** |
+| `BATCHES` | started=**3799** early_share=**777** full=**3021** avg_flight_s=**0.0233** hashes_per_flight≈**2.05e6** |
+
+**Interpretation:** teardown is almost all `wake_s`. After a ~23 ms flight the main thread was still inside the ~20 ms in-flight `select`, so it noticed the batch ~8 ms late. That tail times thousands of batches is ~26% of wall. Job / midstate / submit were not the gap.
+
+A wake/poll fix is in this PR. The last finishing worker writes a self-pipe that the same in-flight `select` watches, so main wakes when the batch ends instead of waiting out the poll timeout. Stratum overlap (E4/E5) stays: socket readability still wakes that `select`, and midstate staging plus async submit are unchanged. **Mac re-measure is pending.** The ~65 MH/s row above is the PR #5 soak, not a post-fix rate. On the next soak, `wake_s` and teardown should fall toward thread-wakeup latency (near 0% of wall) while `TIME_SPLIT_GAPS` still prints.
 
 ```sh
 caffeinate -dims ./miner_test --testnet --seconds 120 --max-shares 0 --threads 6 --suggest-diff 0.001

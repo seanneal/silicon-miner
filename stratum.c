@@ -530,24 +530,46 @@ static void handle_line(stratum_client_t *c, const char *line) {
     }
 }
 
-int stratum_poll(stratum_client_t *c, int timeout_ms) {
+static void drain_nonblock(int fd) {
+    char buf[64];
+    for (;;) {
+        ssize_t n = read(fd, buf, sizeof buf);
+        if (n > 0) continue;
+        if (n < 0 && errno == EINTR) continue;
+        return;
+    }
+}
+
+int stratum_poll_wake(stratum_client_t *c, int timeout_ms, int wake_fd, int *woke) {
+    if (woke) *woke = 0;
     if (c->fd < 0) return -1;
     /* Select wait is not JSON work. Callers that print TIME_SPLIT can keep
-     * the two counters apart (a timeout must not look like notify parsing). */
+     * the two counters apart (a timeout must not look like notify parsing).
+     * wake_fd lets the miner interrupt this wait when a hash batch ends
+     * without giving up socket readability (job notify / submit replies). */
     uint64_t t0 = mono_ns();
     fd_set rfds;
     FD_ZERO(&rfds);
     FD_SET(c->fd, &rfds);
+    int maxfd = c->fd;
+    if (wake_fd >= 0) {
+        FD_SET(wake_fd, &rfds);
+        if (wake_fd > maxfd) maxfd = wake_fd;
+    }
     struct timeval tv;
     tv.tv_sec = timeout_ms / 1000;
     tv.tv_usec = (timeout_ms % 1000) * 1000;
-    int rv = select(c->fd + 1, &rfds, NULL, NULL, &tv);
+    int rv = select(maxfd + 1, &rfds, NULL, NULL, &tv);
     c->poll_wait_ns += mono_ns() - t0;
     if (rv < 0) {
         if (errno == EINTR) return 0;
         return -1;
     }
-    if (rv == 0) return 0;
+    if (wake_fd >= 0 && rv > 0 && FD_ISSET(wake_fd, &rfds)) {
+        if (woke) *woke = 1;
+        drain_nonblock(wake_fd);
+    }
+    if (rv == 0 || !FD_ISSET(c->fd, &rfds)) return 0;
 
     t0 = mono_ns();
     int rc = 1;
@@ -582,6 +604,10 @@ int stratum_poll(stratum_client_t *c, int timeout_ms) {
     }
     c->poll_busy_ns += mono_ns() - t0;
     return rc;
+}
+
+int stratum_poll(stratum_client_t *c, int timeout_ms) {
+    return stratum_poll_wake(c, timeout_ms, -1, NULL);
 }
 
 static int wait_reply(stratum_client_t *c, int id, int timeout_ms) {
