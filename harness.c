@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <unistd.h>
+#include <stdatomic.h>
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -79,6 +80,12 @@ static const uint32_t TARGET_NEVER[8] = {
 static volatile sig_atomic_t g_stop = 0;
 static void on_sigint(int sig) { (void)sig; g_stop = 1; }
 
+/* Default on. --no-pin clears it. macOS only; Linux reports PIN=na. */
+static int g_pin_cores = 1;
+/* Set by the testnet loop so a clean_jobs notify stops stale hashing. */
+static _Atomic int g_scan_cancel = 0;
+static _Atomic int g_scan_finished = 0;
+
 static void be_words_from_block(uint32_t w_be[16], const uint8_t block[64]) {
     for (int i = 0; i < 16; i++) {
         w_be[i] = ((uint32_t)block[i*4+0] << 24) |
@@ -111,17 +118,56 @@ static double monotonic_seconds(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
-/* Best-effort P-core / QoS hint on macOS. Thread affinity APIs are limited. */
-static void try_pcore_affinity(void) {
+/*
+ * Pin one mining thread.
+ * macOS has no public "bind to CPU index" API. Two documented knobs:
+ *   1. pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE) — scheduler
+ *      prefers performance cores.
+ *   2. thread_policy_set(THREAD_AFFINITY_POLICY) with a non-zero tag —
+ *      threads that share a tag prefer the same L2 cache; distinct tags
+ *      (1..N, one per worker) ask the scheduler to spread them.
+ * Tag 0 means "no affinity", so tags start at 1. index is the worker slot.
+ */
+static void apply_worker_pin(int index) {
 #ifdef __APPLE__
-    int rc = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-    if (rc != 0) {
-        fprintf(stderr, "NOTE: pthread_set_qos_class_self_np unavailable/failed (%d)\n", rc);
-    } else {
-        fprintf(stderr, "NOTE: QoS USER_INTERACTIVE set (best-effort P-core hint)\n");
-    }
+    if (!g_pin_cores) return;
+    if (index < 0) index = 0;
+    (void)pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    thread_affinity_policy_data_t pol;
+    pol.affinity_tag = index + 1;
+    thread_port_t th = pthread_mach_thread_np(pthread_self());
+    (void)thread_policy_set(th, THREAD_AFFINITY_POLICY,
+                            (thread_policy_t)&pol, THREAD_AFFINITY_POLICY_COUNT);
 #else
-    fprintf(stderr, "NOTE: P-core affinity not applicable on this OS\n");
+    (void)index;
+#endif
+}
+
+static void report_pin_policy(int threads) {
+#ifdef __APPLE__
+    if (!g_pin_cores) {
+        printf("PIN=off\n");
+        fprintf(stderr, "PIN_NOTE=--no-pin; workers are not affinity-tagged\n");
+        return;
+    }
+    int qos_rc = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    thread_affinity_policy_data_t pol;
+    pol.affinity_tag = 1;
+    thread_port_t th = pthread_mach_thread_np(pthread_self());
+    kern_return_t aff_rc = thread_policy_set(th, THREAD_AFFINITY_POLICY,
+                                              (thread_policy_t)&pol,
+                                              THREAD_AFFINITY_POLICY_COUNT);
+    printf("PIN=on\n");
+    fprintf(stderr,
+            "PIN_METHOD=QOS_CLASS_USER_INTERACTIVE + THREAD_AFFINITY_POLICY tags=1..%d\n"
+            "PIN_QOS_RC=%d PIN_AFFINITY_RC=%d\n"
+            "PIN_NOTE=QoS requests performance cores; distinct affinity tags spread workers. "
+            "Not a hard CPU-index pin (no public API for that).\n",
+            threads, qos_rc, (int)aff_rc);
+#else
+    (void)threads;
+    printf("PIN=na\n");
+    fprintf(stderr, "PIN_NOTE=THREAD_AFFINITY_POLICY and QoS are macOS-only\n");
 #endif
 }
 
@@ -178,11 +224,9 @@ static int easy_target_hit(const uint32_t digest[8]) {
 
 #define MAX_MINE_THREADS 256
 
-/* QoS hint per worker. Main thread still logs the one-time note. */
-static void worker_qos_hint(void) {
-#ifdef __APPLE__
-    (void)pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-#endif
+/* Kept so a reader sees pin happens inside the worker, not only on main. */
+static void worker_qos_hint(int pin_index) {
+    apply_worker_pin(pin_index);
 }
 
 static int clamp_threads(int threads) {
@@ -289,6 +333,7 @@ typedef struct {
     const uint32_t *expect;
     uint32_t found;
     int hit;
+    int pin_index;
 } mine_slice_t;
 
 typedef struct {
@@ -300,6 +345,13 @@ typedef struct {
     uint32_t found;
     int hit;
     uint32_t hashed;
+    int pin_index;
+    _Atomic int *finished; /* optional; testnet background scan */
+    /* Set only for the live Stratum scan. A hit is queued from this worker
+     * so the other slices keep hashing through the pool round-trip. */
+    const char *job_id;
+    const char *ntime;
+    uint64_t en2;
 } scan_slice_t;
 
 typedef struct {
@@ -308,9 +360,11 @@ typedef struct {
     uint64_t hashes;
 } scan_result_t;
 
+static int share_q_push(const char *job_id, const char *ntime, uint64_t en2, uint32_t nonce);
+
 static void *mine_slice_worker(void *arg) {
     mine_slice_t *s = (mine_slice_t *)arg;
-    worker_qos_hint();
+    worker_qos_hint(s->pin_index);
     uint32_t found = 0;
     s->hit = sha256d_mine_midstate(s->mid, s->w_be, s->nonce_start, s->nonce_count,
                                    s->expect, &found);
@@ -320,22 +374,27 @@ static void *mine_slice_worker(void *arg) {
 
 static void *scan_slice_worker(void *arg) {
     scan_slice_t *s = (scan_slice_t *)arg;
-    worker_qos_hint();
+    worker_qos_hint(s->pin_index);
     uint32_t dig[8];
     s->hit = 0;
     s->found = 0;
     s->hashed = 0;
     for (uint32_t i = 0; i < s->nonce_count; i++) {
-        if ((i & 4095u) == 0 && g_stop) break;
+        if (g_stop || atomic_load_explicit(&g_scan_cancel, memory_order_relaxed))
+            break;
         uint32_t nonce = s->nonce_start + i;
         sha256d_asm_one(s->mid, s->w_be, nonce, dig);
         s->hashed++;
         if (stratum_hash_meets_target(dig, s->target)) {
             s->hit = 1;
             s->found = nonce;
+            if (s->job_id)
+                (void)share_q_push(s->job_id, s->ntime, s->en2, nonce);
             break;
         }
     }
+    if (s->finished)
+        atomic_fetch_add_explicit(s->finished, 1, memory_order_release);
     return NULL;
 }
 
@@ -386,6 +445,7 @@ static int mine_midstate_n(const uint32_t mid[8], const uint32_t w_be[16],
     uint32_t counts[MAX_MINE_THREADS];
     int used = partition_nonce_ranges(nonce_start, nonce_count, threads, starts, counts);
     if (used <= 1) {
+        apply_worker_pin(0);
         return sha256d_mine_midstate(mid, w_be, nonce_start, nonce_count,
                                      expect, found_nonce);
     }
@@ -399,6 +459,7 @@ static int mine_midstate_n(const uint32_t mid[8], const uint32_t w_be[16],
         slices[i].expect = expect;
         slices[i].found = 0;
         slices[i].hit = 0;
+        slices[i].pin_index = i;
     }
     run_workers(used, mine_slice_worker, slices, sizeof slices[0]);
 
@@ -448,6 +509,11 @@ static scan_result_t scan_share_n(const uint32_t mid[8], const uint32_t w_be[16]
         slices[i].found = 0;
         slices[i].hit = 0;
         slices[i].hashed = 0;
+        slices[i].pin_index = i;
+        slices[i].finished = NULL;
+        slices[i].job_id = NULL;
+        slices[i].ntime = NULL;
+        slices[i].en2 = 0;
     }
     if (used <= 1) {
         scan_slice_worker(&slices[0]);
@@ -740,9 +806,237 @@ static int run_selftest(int threads) {
     return 0;
 }
 
+/* One prepared header. Workers read it; the main thread fills the other copy. */
+typedef struct {
+    uint32_t mid[8];
+    uint32_t w_be[16];
+    uint8_t  target[32];
+    char     job_id[STRATUM_JOB_ID_MAX];
+    char     ntime[16];
+    uint64_t seq;
+    uint64_t en2;
+    uint32_t nonce_cursor;
+    int      clean;
+    int      ready;
+} work_buf_t;
+
+typedef struct {
+    pthread_t tid[MAX_MINE_THREADS];
+    unsigned char started[MAX_MINE_THREADS];
+    scan_slice_t slices[MAX_MINE_THREADS];
+    int n;
+    int running;
+} scan_flight_t;
+
+#define SHARE_Q 64
+typedef struct {
+    char job_id[STRATUM_JOB_ID_MAX];
+    char ntime[16];
+    uint64_t en2;
+    uint32_t nonce;
+} share_q_item_t;
+
+static share_q_item_t g_share_q[SHARE_Q];
+static int g_share_head;
+static int g_share_tail;
+static pthread_mutex_t g_share_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int share_q_push(const char *job_id, const char *ntime, uint64_t en2, uint32_t nonce) {
+    pthread_mutex_lock(&g_share_mu);
+    int next = (g_share_tail + 1) % SHARE_Q;
+    if (next == g_share_head) {
+        pthread_mutex_unlock(&g_share_mu);
+        fprintf(stderr, "STRATUM: local share queue full nonce=%08x\n", nonce);
+        return -1;
+    }
+    share_q_item_t *it = &g_share_q[g_share_tail];
+    snprintf(it->job_id, sizeof it->job_id, "%s", job_id ? job_id : "");
+    snprintf(it->ntime, sizeof it->ntime, "%s", ntime ? ntime : "");
+    it->en2 = en2;
+    it->nonce = nonce;
+    g_share_tail = next;
+    pthread_mutex_unlock(&g_share_mu);
+    return 0;
+}
+
+/* Send queued shares. A failed send leaves the item queued for the next poll.
+ * Hash workers are not joined for the pool reply. */
+static void share_q_flush(stratum_client_t *c) {
+    for (;;) {
+        share_q_item_t it;
+        pthread_mutex_lock(&g_share_mu);
+        if (g_share_head == g_share_tail) {
+            pthread_mutex_unlock(&g_share_mu);
+            return;
+        }
+        it = g_share_q[g_share_head];
+        pthread_mutex_unlock(&g_share_mu);
+        if (stratum_submit_async(c, it.job_id, it.en2, it.ntime, it.nonce) != 0)
+            return;
+        pthread_mutex_lock(&g_share_mu);
+        g_share_head = (g_share_head + 1) % SHARE_Q;
+        pthread_mutex_unlock(&g_share_mu);
+        printf("SHARE_QUEUED nonce=0x%08x job=%s pending=%d accepted=%llu rejected=%llu\n",
+               it.nonce, it.job_id, c->submit_pending,
+               (unsigned long long)c->shares_accepted,
+               (unsigned long long)c->shares_rejected);
+        fflush(stdout);
+    }
+}
+
+static int prepare_work(stratum_client_t *c, work_buf_t *w, uint64_t en2) {
+    uint8_t header[80];
+    if (stratum_build_header(c, en2, 0, header) != 0) return -1;
+    compute_midstate(w->mid, header);
+    build_block1_wbe(w->w_be, header);
+    stratum_share_target(c->difficulty, w->target);
+    snprintf(w->job_id, sizeof w->job_id, "%s", c->job.job_id);
+    snprintf(w->ntime, sizeof w->ntime, "%s", c->job.ntime);
+    w->seq = c->job.seq;
+    w->en2 = en2;
+    w->nonce_cursor = 0;
+    w->clean = c->job.clean ? 1 : 0;
+    w->ready = 1;
+    return 0;
+}
+
+static void scan_join(scan_flight_t *f, scan_result_t *r) {
+    r->hit = 0;
+    r->nonce = 0;
+    r->hashes = 0;
+    if (!f->running) return;
+    for (int i = 0; i < f->n; i++) {
+        if (f->started[i]) pthread_join(f->tid[i], NULL);
+    }
+    uint32_t best_off = 0;
+    uint32_t origin = 0;
+    int have_origin = 0;
+    for (int i = 0; i < f->n; i++) {
+        r->hashes += f->slices[i].hashed;
+        if (!have_origin) {
+            origin = f->slices[i].nonce_start;
+            have_origin = 1;
+        }
+        if (!f->slices[i].hit) continue;
+        if (earlier_hit(r->hit, best_off, origin, f->slices[i].found)) {
+            r->hit = 1;
+            r->nonce = f->slices[i].found;
+            best_off = f->slices[i].found - origin;
+        }
+    }
+    f->running = 0;
+    f->n = 0;
+}
+
+/* Background share scan. Main keeps the socket. Returns 0, or -1 if no thread. */
+static int scan_start(scan_flight_t *f, const work_buf_t *w, uint32_t count, int threads) {
+    memset(f, 0, sizeof *f);
+    if (!w->ready || count == 0) return -1;
+    threads = clamp_threads(threads);
+    uint32_t starts[MAX_MINE_THREADS];
+    uint32_t counts[MAX_MINE_THREADS];
+    int used = partition_nonce_ranges(w->nonce_cursor, count, threads, starts, counts);
+    if (used < 1) return -1;
+
+    atomic_store_explicit(&g_scan_cancel, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_scan_finished, 0, memory_order_relaxed);
+
+    for (int i = 0; i < used; i++) {
+        scan_slice_t *s = &f->slices[i];
+        s->mid = w->mid;
+        s->w_be = w->w_be;
+        s->target = w->target;
+        s->nonce_start = starts[i];
+        s->nonce_count = counts[i];
+        s->found = 0;
+        s->hit = 0;
+        s->hashed = 0;
+        s->pin_index = i;
+        s->finished = &g_scan_finished;
+        s->job_id = w->job_id;
+        s->ntime = w->ntime;
+        s->en2 = w->en2;
+        if (pthread_create(&f->tid[i], NULL, scan_slice_worker, s) != 0) {
+            fprintf(stderr, "NOTE: pthread_create failed at scan worker %d\n", i);
+            atomic_store_explicit(&g_scan_cancel, 1, memory_order_relaxed);
+            for (int j = 0; j < i; j++) {
+                if (f->started[j]) pthread_join(f->tid[j], NULL);
+            }
+            f->n = 0;
+            f->running = 0;
+            return -1;
+        }
+        f->started[i] = 1;
+    }
+    f->n = used;
+    f->running = 1;
+    return 0;
+}
+
+static int scan_done(const scan_flight_t *f) {
+    if (!f->running) return 1;
+    return atomic_load_explicit(&g_scan_finished, memory_order_acquire) >= f->n;
+}
+
+/*
+ * Offline multi-thread soak. Prints periodic H/s so a short batch and a
+ * sustained run can be compared. Does not open a socket.
+ */
+static int run_soak(const uint32_t mid[8], const uint32_t w_be[16],
+                    int seconds, int threads, double report_s) {
+    if (seconds < 1) seconds = 1;
+    if (report_s < 0.2) report_s = 0.2;
+    const uint32_t chunk = 1u << 20;
+    printf("\n=== SOAK (offline, no pool) ===\n");
+    printf("SOAK_SECONDS=%d THREADS=%d REPORT_S=%.2f CHUNK=%u\n",
+           seconds, threads, report_s, chunk);
+    signal(SIGINT, on_sigint);
+    signal(SIGTERM, on_sigint);
+
+    uint64_t hashes = 0;
+    uint64_t hashes_mark = 0;
+    uint32_t nonce = 0;
+    double t0 = monotonic_seconds();
+    double t_mark = t0;
+    while (!g_stop) {
+        double now = monotonic_seconds();
+        if ((now - t0) >= (double)seconds) break;
+        uint32_t found = 0;
+        mine_midstate_n(mid, w_be, nonce, chunk, TARGET_NEVER, &found, threads);
+        hashes += chunk;
+        nonce += chunk;
+        now = monotonic_seconds();
+        if ((now - t_mark) >= report_s) {
+            double idt = now - t_mark;
+            double adt = now - t0;
+            if (idt < 1e-9) idt = 1e-9;
+            if (adt < 1e-9) adt = 1e-9;
+            printf("SOAK t=%.1f hashes=%llu H/s=%.0f H/s_avg=%.0f threads=%d\n",
+                   adt, (unsigned long long)hashes,
+                   (double)(hashes - hashes_mark) / idt,
+                   (double)hashes / adt, threads);
+            fflush(stdout);
+            t_mark = now;
+            hashes_mark = hashes;
+        }
+    }
+    double dt = monotonic_seconds() - t0;
+    if (dt < 1e-9) dt = 1e-9;
+    double hs = (double)hashes / dt;
+    printf("SOAK_HASHES=%llu\n", (unsigned long long)hashes);
+    printf("SOAK_ELAPSED_S=%.3f\n", dt);
+    printf("SOAK_AVG_H/s=%.0f\n", hs);
+    printf("H/s=%.0f\n", hs);
+    printf("threads=%d\n", threads);
+    printf("RESULT: PASS\n");
+    return 0;
+}
+
 /*
  * Testnet Stratum mine loop:
- *  connect → suggest_diff → authorize → jobs → midstate asm hash → submit shares
+ *  connect → jobs → hash workers
+ *  main thread polls the socket while workers hash, stages the next job's
+ *  midstate on the side, and sends shares without waiting for the reply.
  */
 static int run_testnet(const char *host, int port, const char *user, const char *pass,
                        double suggest_diff, int seconds, int max_shares, int threads) {
@@ -767,94 +1061,123 @@ static int run_testnet(const char *host, int port, const char *user, const char 
         return 1;
     }
 
-    uint8_t target[32];
-    stratum_share_target(client.difficulty, target);
-    double expect_s = client.difficulty * 4294967296.0 / 25e6; /* rough at 25 MH/s */
-    printf("STRATUM: difficulty=%.8g expect_share@25MH/s=%.2fs\n",
-           client.difficulty, expect_s);
-    printf("STRATUM: target=");
-    for (int i = 0; i < 32; i++) printf("%02x", target[i]);
-    printf("\n");
+    printf("STRATUM: difficulty=%.8g\n", client.difficulty);
+
+    work_buf_t active, staging;
+    memset(&active, 0, sizeof active);
+    memset(&staging, 0, sizeof staging);
+    g_share_head = 0;
+    g_share_tail = 0;
+    if (prepare_work(&client, &active, 0) != 0) {
+        printf("RESULT: FAIL (build_header)\n");
+        stratum_close(&client);
+        return 1;
+    }
+    printf("STRATUM: job id=%s clean=%d\n", active.job_id, active.clean);
+
+    /* Long enough that a notify usually arrives mid-batch, so the next
+     * midstate is built while workers are still hashing. */
+    uint32_t scan_batch = 2u << 20;
+    printf("STRATUM: scan_batch=%u threads=%d\n", scan_batch, threads);
 
     uint64_t hashes = 0;
-    uint64_t extranonce2 = 0;
-    uint32_t nonce_cursor = 0;
-    uint64_t job_seq = 0;
-    uint32_t mid[8], w_be[16];
-    uint8_t header80[80];
-    int header_ready = 0;
+    uint64_t staged_while_hashing = 0;
+    int staged = 0;
     double t0 = monotonic_seconds();
     double t_last_report = t0;
-    /*
-     * Per-round nonce span. With N>1, scale so each worker still sees about
-     * one 64Ki batch, capped so a new job is noticed within ~1M nonces.
-     */
-    uint32_t scan_batch = 65536u;
-    if (threads > 1) {
-        uint64_t scaled = (uint64_t)scan_batch * (unsigned)threads;
-        if (scaled > 1024ull * 1024ull) scaled = 1024ull * 1024ull;
-        scan_batch = (uint32_t)scaled;
-    }
-    printf("STRATUM: scan_batch=%u threads=%d\n", scan_batch, threads);
+    scan_flight_t flight;
+    memset(&flight, 0, sizeof flight);
 
     while (!g_stop) {
         double now = monotonic_seconds();
         if (seconds > 0 && (now - t0) >= (double)seconds) break;
         if (max_shares > 0 && (int)client.shares_accepted >= max_shares) break;
 
-        stratum_poll(&client, 0);
-
-        if (!client.have_job) {
-            stratum_poll(&client, 50);
-            continue;
-        }
-
-        /* New job → reset extranonce2 / nonce cursor */
-        if (client.job.seq != job_seq) {
-            job_seq = client.job.seq;
-            extranonce2 = 0;
-            nonce_cursor = 0;
-            header_ready = 0;
-            stratum_share_target(client.difficulty, target);
-            printf("STRATUM: new job id=%s diff=%.8g\n",
-                   client.job.job_id, client.difficulty);
-        }
-
-        /* Rebuild midstate when job or extranonce2 changed */
-        if (!header_ready) {
-            if (stratum_build_header(&client, extranonce2, 0, header80) != 0) {
-                fprintf(stderr, "STRATUM: build_header failed\n");
+        if (!flight.running) {
+            if (!active.ready && prepare_work(&client, &active, active.en2) != 0) {
+                stratum_poll(&client, 50);
+                continue;
+            }
+            if (scan_start(&flight, &active, scan_batch, threads) != 0) {
+                fprintf(stderr, "STRATUM: scan_start failed\n");
                 break;
             }
-            compute_midstate(mid, header80);
-            build_block1_wbe(w_be, header80);
-            header_ready = 1;
         }
 
-        /* Share search: disjoint slices, asm compress + C target check. */
-        scan_result_t sr = scan_share_n(mid, w_be, target, nonce_cursor, scan_batch, threads);
-        hashes += sr.hashes;
-        if (sr.hit) {
-            printf("SHARE_CANDIDATE nonce=0x%08x en2=%llu job=%s\n",
-                   sr.nonce, (unsigned long long)extranonce2, client.job.job_id);
-            int rc = stratum_submit(&client, extranonce2, client.job.ntime, sr.nonce);
-            printf("SHARE_SUBMIT rc=%d accepted=%llu rejected=%llu\n",
-                   rc,
-                   (unsigned long long)client.shares_accepted,
-                   (unsigned long long)client.shares_rejected);
-            extranonce2++;
-            nonce_cursor = 0;
-            header_ready = 0;
+        stratum_poll(&client, 20);
+        share_q_flush(&client);
+
+        {
+            uint64_t cur_seq = staged ? staging.seq : active.seq;
+            if (client.have_job && client.job.seq != cur_seq) {
+                int clean = client.job.clean ? 1 : 0;
+                int hashing = flight.running && !scan_done(&flight);
+                if (clean)
+                    atomic_store_explicit(&g_scan_cancel, 1, memory_order_relaxed);
+                if (prepare_work(&client, &staging, 0) == 0) {
+                    staged = 1;
+                    if (hashing) staged_while_hashing++;
+                    printf("STRATUM: staged job id=%s seq=%llu clean=%d while_hashing=%d\n",
+                           staging.job_id, (unsigned long long)staging.seq,
+                           staging.clean, hashing);
+                    fflush(stdout);
+                }
+            }
         }
-        if (!sr.hit) {
-            uint64_t next = (uint64_t)nonce_cursor + scan_batch;
-            if (next >= 0x100000000ULL) {
-                /* nonce space exhausted for this extranonce2 — roll */
-                extranonce2++;
-                nonce_cursor = 0;
-                header_ready = 0;
+
+        if (flight.running && scan_done(&flight)) {
+            scan_result_t sr;
+            uint32_t batch_start = active.nonce_cursor;
+            int abandoned = atomic_load_explicit(&g_scan_cancel, memory_order_relaxed);
+            scan_join(&flight, &sr);
+            hashes += sr.hashes;
+            /* Hits were queued by the worker that found them, while the
+             * other slices kept hashing. Flush anything still local. */
+            if (sr.hit)
+                printf("SHARE_CANDIDATE nonce=0x%08x en2=%llu job=%s\n",
+                       sr.nonce, (unsigned long long)active.en2, active.job_id);
+            share_q_flush(&client);
+
+            if (staged) {
+                active = staging;
+                memset(&staging, 0, sizeof staging);
+                staged = 0;
+                active.nonce_cursor = 0;
+                printf("STRATUM: switch job id=%s clean=%d (midstate already built)\n",
+                       active.job_id, active.clean);
+            } else if (abandoned) {
+                active.ready = 0;
+                active.nonce_cursor = 0;
+                if (client.have_job && prepare_work(&client, &active, 0) == 0)
+                    printf("STRATUM: resumed on job id=%s after clean cancel\n", active.job_id);
+            } else if (sr.hit) {
+                uint64_t en2 = active.en2 + 1;
+                if (prepare_work(&client, &active, en2) != 0) {
+                    fprintf(stderr, "STRATUM: rebuild after share failed\n");
+                    break;
+                }
             } else {
-                nonce_cursor = (uint32_t)next;
+                uint64_t next = (uint64_t)batch_start + sr.hashes;
+                if (sr.hashes == 0) next = (uint64_t)batch_start + scan_batch;
+                /* batch_start + hashes is uint64, so wrap is next past 2^32.
+                 * A uint32 comparison would promote and miss the wrap. */
+                if (next >= 0x100000000ULL) {
+                    uint64_t en2 = active.en2 + 1;
+                    if (prepare_work(&client, &active, en2) != 0) break;
+                } else {
+                    active.nonce_cursor = batch_start + (uint32_t)sr.hashes;
+                    stratum_share_target(client.difficulty, active.target);
+                }
+            }
+
+            now = monotonic_seconds();
+            if (g_stop) break;
+            if (seconds > 0 && (now - t0) >= (double)seconds) break;
+            if (max_shares > 0 && (int)client.shares_accepted >= max_shares) break;
+            if (!active.ready) continue;
+            if (scan_start(&flight, &active, scan_batch, threads) != 0) {
+                fprintf(stderr, "STRATUM: scan_start failed\n");
+                break;
             }
         }
 
@@ -863,29 +1186,28 @@ static int run_testnet(const char *host, int port, const char *user, const char 
             double dt = now - t0;
             double hs = (dt > 1e-9) ? (double)hashes / dt : 0.0;
             printf("STATUS connected=1 jobs=%llu hashes=%llu H/s=%.0f threads=%d "
-                   "diff=%.8g shares_ok=%llu shares_bad=%llu en2=%llu\n",
+                   "diff=%.8g shares_ok=%llu shares_bad=%llu pending=%d "
+                   "staged_overlap=%llu en2=%llu\n",
                    (unsigned long long)client.jobs_seen,
                    (unsigned long long)hashes, hs, threads, client.difficulty,
                    (unsigned long long)client.shares_accepted,
                    (unsigned long long)client.shares_rejected,
-                   (unsigned long long)extranonce2);
+                   client.submit_pending,
+                   (unsigned long long)staged_while_hashing,
+                   (unsigned long long)active.en2);
+            fflush(stdout);
             t_last_report = now;
         }
-
-        /* dual-lane H/s probe once early (equality mine, not the share target) */
-        static int probed = 0;
-        if (!probed && hashes > scan_batch) {
-            uint32_t found = 0;
-            const uint32_t probe_n = 2000000u;
-            double a0 = monotonic_seconds();
-            mine_midstate_n(mid, w_be, 0u, probe_n, TARGET_NEVER, &found, threads);
-            double a1 = monotonic_seconds();
-            double adt = a1 - a0;
-            if (adt < 1e-9) adt = 1e-9;
-            printf("ASM_DUAL_LANE_H/s=%.0f threads=%d\n", (double)probe_n / adt, threads);
-            probed = 1;
-        }
     }
+
+    if (flight.running) {
+        atomic_store_explicit(&g_scan_cancel, 1, memory_order_relaxed);
+        scan_result_t sr;
+        scan_join(&flight, &sr);
+        hashes += sr.hashes;
+    }
+    share_q_flush(&client);
+    int pending_left = stratum_submit_drain(&client, 3000);
 
     double t1 = monotonic_seconds();
     double dt = t1 - t0;
@@ -896,6 +1218,7 @@ static int run_testnet(const char *host, int port, const char *user, const char 
     printf("endpoint=%s:%d\n", host, port);
     printf("authorized=%d\n", (int)client.authorized);
     printf("jobs_seen=%llu\n", (unsigned long long)client.jobs_seen);
+    printf("jobs_staged_while_hashing=%llu\n", (unsigned long long)staged_while_hashing);
     printf("difficulty=%.8g\n", client.difficulty);
     printf("hashes=%llu\n", (unsigned long long)hashes);
     printf("H/s=%.0f\n", hs);
@@ -903,6 +1226,7 @@ static int run_testnet(const char *host, int port, const char *user, const char 
     printf("shares_submitted=%llu\n", (unsigned long long)client.shares_submitted);
     printf("shares_accepted=%llu\n", (unsigned long long)client.shares_accepted);
     printf("shares_rejected=%llu\n", (unsigned long long)client.shares_rejected);
+    printf("submit_pending=%d\n", pending_left);
     printf("elapsed_s=%.2f\n", dt);
     printf("expect_share_s@this_rate=%.2f\n",
            client.difficulty * 4294967296.0 / (hs > 1.0 ? hs : 1.0));
@@ -926,13 +1250,16 @@ static void usage(const char *argv0) {
         "Usage:\n"
         "  %s                     genesis self-test + timed batch\n"
         "  %s --metrics [N]       metrics harness\n"
+        "  %s --soak SEC          offline multi-thread hash for SEC seconds\n"
+        "                         prints H/s every --report interval (default 2s)\n"
         "  %s --threads N         worker count (default: P-cores or hw.ncpu)\n"
+        "  %s --pin / --no-pin    macOS P-core QoS + affinity tags (default --pin)\n"
         "  %s --testnet           mine BTCLab testnet3 (suggest_diff=0.001)\n"
         "  %s --stratum HOST:PORT --user USER [--pass PASS] [--suggest-diff D]\n"
         "                         [--seconds N] [--max-shares N] [--threads N]\n"
         "\n"
         "Educational testnet only. No mainnet / AntPool.\n",
-        argv0, argv0, argv0, argv0, argv0);
+        argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 int main(int argc, char **argv) {
@@ -949,6 +1276,9 @@ int main(int argc, char **argv) {
     int have_stratum = 0;
     int threads = 0;
     int threads_set = 0;
+    int soak_mode = 0;
+    int soak_seconds = 0;
+    double report_s = 2.0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -984,6 +1314,15 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
             threads = atoi(argv[++i]);
             threads_set = 1;
+        } else if (strcmp(argv[i], "--soak") == 0 && i + 1 < argc) {
+            soak_mode = 1;
+            soak_seconds = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--report") == 0 && i + 1 < argc) {
+            report_s = strtod(argv[++i], NULL);
+        } else if (strcmp(argv[i], "--pin") == 0) {
+            g_pin_cores = 1;
+        } else if (strcmp(argv[i], "--no-pin") == 0) {
+            g_pin_cores = 0;
         } else if (argv[i][0] >= '0' && argv[i][0] <= '9') {
             batch = (uint32_t)strtoul(argv[i], NULL, 10);
             if (batch == 0) batch = 2000000;
@@ -1002,7 +1341,16 @@ int main(int argc, char **argv) {
     printf("silicon-miner educational harness\n");
     printf("=================================\n");
     printf("THREADS=%d (%s)\n", threads, thread_src);
-    try_pcore_affinity();
+    report_pin_policy(threads);
+
+    if (soak_mode && (have_stratum || testnet_mode)) {
+        fprintf(stderr, "--soak is offline and cannot be combined with --testnet/--stratum\n");
+        return 2;
+    }
+    if (soak_mode && soak_seconds < 1) {
+        fprintf(stderr, "--soak requires a positive number of seconds\n");
+        return 2;
+    }
 
     if (run_selftest(threads) != 0) {
         printf("ENERGY_PLACEHOLDER_IDLE_W=na\n");
@@ -1022,6 +1370,9 @@ int main(int argc, char **argv) {
     uint32_t mid[8], w_be[16], found = 0;
     compute_midstate(mid, GENESIS_HEADER);
     build_block1_wbe(w_be, GENESIS_HEADER);
+
+    if (soak_mode)
+        return run_soak(mid, w_be, soak_seconds, threads, report_s);
 
     if (metrics_mode) {
         run_metrics(batch, mid, w_be, GENESIS_HEADER, threads);

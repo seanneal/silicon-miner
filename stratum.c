@@ -508,6 +508,24 @@ static void handle_line(stratum_client_t *c, const char *line) {
         if (strstr(line, "\"result\":false") || strstr(line, "\"result\": false"))
             c->last_reply_ok = false;
         c->last_reply_ready = true;
+        /* Async mining.submit: account here so the hash pool is not joined
+         * on the pool round-trip. Blocking stratum_submit does not use a slot. */
+        for (int i = 0; i < STRATUM_SUBMIT_SLOTS; i++) {
+            if (c->submit_slot[i].id == (int)id) {
+                uint32_t nonce = c->submit_slot[i].nonce;
+                c->submit_slot[i].id = 0;
+                c->submit_slot[i].nonce = 0;
+                if (c->submit_pending > 0) c->submit_pending--;
+                if (c->last_reply_ok) {
+                    c->shares_accepted++;
+                    fprintf(stderr, "STRATUM: share ACCEPTED nonce=%08x\n", nonce);
+                } else {
+                    c->shares_rejected++;
+                    fprintf(stderr, "STRATUM: share REJECTED nonce=%08x\n", nonce);
+                }
+                break;
+            }
+        }
     }
 }
 
@@ -744,6 +762,64 @@ int stratum_build_header(const stratum_client_t *c, uint64_t extranonce2,
     store_u32_le(header80 + 72, nbits);
     store_u32_le(header80 + 76, nonce);
     return 0;
+}
+
+static int submit_alloc_slot(stratum_client_t *c, int id, uint32_t nonce) {
+    for (int i = 0; i < STRATUM_SUBMIT_SLOTS; i++) {
+        if (c->submit_slot[i].id == 0) {
+            c->submit_slot[i].id = id;
+            c->submit_slot[i].nonce = nonce;
+            c->submit_pending++;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+int stratum_submit_async(stratum_client_t *c, const char *job_id,
+                         uint64_t extranonce2, const char *ntime_hex,
+                         uint32_t nonce) {
+    if (c->fd < 0 || !job_id || !job_id[0] || !ntime_hex) return -1;
+    char en2hex[32];
+    char noncehex[16];
+    stratum_en2_hex(extranonce2, c->extranonce2_size, en2hex);
+    snprintf(noncehex, sizeof noncehex, "%08x", nonce);
+
+    int id = c->next_id++;
+    if (submit_alloc_slot(c, id, nonce) != 0) {
+        c->next_id--;
+        fprintf(stderr, "STRATUM: submit queue full\n");
+        return -1;
+    }
+    char params[1024];
+    snprintf(params, sizeof params, "[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]",
+             c->user, job_id, en2hex, ntime_hex, noncehex);
+    c->shares_submitted++;
+    if (stratum_send_req(c, id, "mining.submit", params) != 0) {
+        for (int i = 0; i < STRATUM_SUBMIT_SLOTS; i++) {
+            if (c->submit_slot[i].id == id) {
+                c->submit_slot[i].id = 0;
+                c->submit_slot[i].nonce = 0;
+                if (c->submit_pending > 0) c->submit_pending--;
+                break;
+            }
+        }
+        c->shares_submitted--;
+        return -1;
+    }
+    fprintf(stderr, "STRATUM: share queued nonce=%s job=%s (hash continues)\n",
+            noncehex, job_id);
+    return 0;
+}
+
+int stratum_submit_drain(stratum_client_t *c, int timeout_ms) {
+    int waited = 0;
+    if (timeout_ms < 0) timeout_ms = 0;
+    while (c->submit_pending > 0 && waited < timeout_ms) {
+        if (stratum_poll(c, 100) < 0) break;
+        waited += 100;
+    }
+    return c->submit_pending;
 }
 
 int stratum_submit(stratum_client_t *c, uint64_t extranonce2,
