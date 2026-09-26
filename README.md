@@ -90,6 +90,8 @@ make testnet
 
 ## Metrics
 
+Recorded MacBookPro18,3 H/s, absolute package energy, and testnet soak: [STATS.md](STATS.md).
+
 **No-power harness metrics** (recommended; no sudo):
 
 ```sh
