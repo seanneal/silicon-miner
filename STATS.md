@@ -102,16 +102,19 @@ Rejects were consistent with stale work on job change, not bad digests.
 
 **Interpretation:** ~39 MH/s is the best **live Stratum soak** so far. Offline batches at 4T/8T are higher because they do not pay job/share/submit overhead.
 
+A later same-day live soak on the TIME_SPLIT build (different vardiff and share counts) is in section 9.
+
 ---
 
 ## 6. Engineering vs formal experiments (status)
 
-Landed on `main` (PR #1 squash merge `86fe9cf`, 2026-09-26):
+Landed on `main` (PR #1 squash merge `86fe9cf`, 2026-09-26). TIME_SPLIT accounting landed (PR #3, `6d37fb6`, 2026-09-26).
 
 | ID | Item | Kind | Status |
 |----|------|------|--------|
 | — | Multi-thread C nonce ranges | eng | Done / on main |
 | — | Dual-lane asm schedule | eng | Done / on main |
+| — | TIME_SPLIT wall accounting | eng | Done / on main (PR #3); Mac live soak in section 9 |
 | E1 | P-core pin (`--pin` / `--no-pin`) | eng | Done / exercised on Mac |
 | E2 | Offline `--soak` | eng | Done |
 | E3 | Multi-thread `measure.sh` | eng | Done (MT peak watts TBD) |
@@ -154,6 +157,36 @@ Keep the machine awake for long runs (`caffeinate -dims` or equivalent).
 
 ## 9. TIME_SPLIT (wall accounting)
 
-The timed batch, `--soak`, and the testnet summary now print `TIME_SPLIT`, `TIME_SPLIT_PCT`, `TIME_SPLIT_CPU`, `TIME_SPLIT_FLIGHT`, `TIME_SPLIT_OVERLAP`, and `TIME_SPLIT_CLOCK`. How to read them is in the README section "Reading TIME_SPLIT".
+The timed batch, `--soak`, and the testnet summary print `TIME_SPLIT`, `TIME_SPLIT_PCT`, `TIME_SPLIT_CPU`, `TIME_SPLIT_FLIGHT`, `TIME_SPLIT_OVERLAP`, and `TIME_SPLIT_CLOCK`. How to read them is in the README section "Reading TIME_SPLIT".
 
-Unmeasured on MacBookPro18,3 until an offline soak and a testnet soak are re-run on that machine. This note does not add H/s figures. The 2026-09-26 offline and live numbers above stand until that re-run.
+### Live Stratum TIME_SPLIT soak (MacBookPro18,3)
+
+Measured 2026-09-26 on branch `cursor/time-split-accounting-73ac` (merged to `main` as PR #3). This run is separate from the section 5 soak (different vardiff and share counts).
+
+| Field | Value |
+|-------|-------|
+| Endpoint | `tn3.btclab.dev:3333` |
+| Duration | **120 s** |
+| Flags | `--threads 6`, `--max-shares 0`, `--suggest-diff 0.001` |
+| H/s | **38499823** (~38.5 MH/s) |
+| Hashes | **4620075128** |
+| Jobs seen | **4** |
+| `jobs_staged_while_hashing` | **1** |
+| Difficulty | ended **0.04** (vardiff **0.001 → 0.04**) |
+| Shares | **528** submitted / **528** accepted / **0** rejected |
+| Result | **PASS** |
+
+Harness lines:
+
+```
+TIME_SPLIT hash_s=73.5287 share_s=7.2885 poll_s=0.0000 midstate_s=0.0030 submit_s=0.0002 other_s=39.1821
+TIME_SPLIT_PCT hash=61.27 share=6.07 poll=0.00 midstate=0.00 submit=0.00 other=32.65
+TIME_SPLIT_CPU hash_s=349.0774 share_s=34.6022 submit_s=0.0010
+TIME_SPLIT_FLIGHT flight_s=80.8174
+TIME_SPLIT_OVERLAP poll_busy_s=0.1119 poll_wait_s=119.5809 midstate_s=0.0000 submit_s=0.0510
+TIME_SPLIT_CLOCK=mach_absolute_time*mach_timebase_info
+```
+
+Same-build offline timed batch (comparison only): ~84.3 MH/s @ 6T (`H/s=84285052` on 2M nonces).
+
+**Interpretation:** poll/midstate/submit idle-path ≈0%; share-check ~6% wall; ~33% wall still in other (batch gaps / unlabeled).
