@@ -15,6 +15,7 @@
 #define STRATUM_COINB_MAX      4096
 #define STRATUM_MERKLE_MAX     32
 #define STRATUM_USER_MAX       256
+#define STRATUM_SUBMIT_SLOTS   16
 
 typedef struct {
     char     job_id[STRATUM_JOB_ID_MAX];
@@ -53,6 +54,13 @@ typedef struct {
     int      last_reply_id;
     bool     last_reply_ok;
     bool     last_reply_ready;
+    /* In-flight mining.submit ids. Replies are applied inside stratum_poll
+     * so hash workers are not stalled on the pool round-trip. id 0 = empty. */
+    struct {
+        int      id;
+        uint32_t nonce;
+    } submit_slot[STRATUM_SUBMIT_SLOTS];
+    int      submit_pending;
 } stratum_client_t;
 
 /* Connect host:port, subscribe, optional suggest_diff, authorize. */
@@ -77,9 +85,19 @@ void stratum_share_target(double difficulty, uint8_t target_be[32]);
 bool stratum_hash_meets_target(const uint32_t digest_words[8],
                                const uint8_t target_be[32]);
 
-/* Submit share; blocks briefly for reply. Returns 1 accepted, 0 rejected, -1 error. */
+/* Submit share and wait for the reply. Returns 1 accepted, 0 rejected, -1 error. */
 int  stratum_submit(stratum_client_t *c, uint64_t extranonce2,
                     const char *ntime_hex, uint32_t nonce);
+
+/* Send mining.submit and return. The reply is counted on a later stratum_poll.
+ * job_id is the job that was hashed (not necessarily c->job, which may have moved).
+ * Returns 0 if the request was written, -1 on send/queue failure. */
+int  stratum_submit_async(stratum_client_t *c, const char *job_id,
+                          uint64_t extranonce2, const char *ntime_hex,
+                          uint32_t nonce);
+
+/* Poll until outstanding async submits drain or timeout. Returns how many remain. */
+int  stratum_submit_drain(stratum_client_t *c, int timeout_ms);
 
 /* Format helpers — size_bytes clamped to 1..8 (SoloPool uses 8). */
 void stratum_en2_hex(uint64_t en2, int size_bytes, char *out /* size*2+1 */);

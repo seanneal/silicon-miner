@@ -7,13 +7,21 @@
 //   - K staged from .rodata (LK256 in __TEXT,__const): 4-vector sliding
 //     window in v28–v31, reloaded every 4 round-groups (ld1 4s×4). K is NOT
 //     kept resident in v16–v31, freeing those regs for a second nonce lane.
-//   - Dual-lane mine: two nonces in flight; crypto ops interleaved to hide
-//     SHA256H/H2 latency. Reg map (mine hot path):
-//       Lane A: v0/v1 state, v2/v3 save, v4–v7 W, v16 WK, v17 h2tmp
-//       Lane B: v18/v19 state, v20/v21 save, v22–v25 W, v26 WK, v27 h2tmp
+//   - Dual-lane mine: two nonces in flight. Reg map (mine hot path):
+//       Lane A: v0/v1 state, v4–v7 W, v16 WK, v17 h2tmp
+//       Lane B: v18/v19 state, v22–v25 W, v26 WK, v27 h2tmp
 //       K window: v28–v31 (from LK256)
 //       Cached (callee-saved): v8/v9 midstate, v10/v11 expect,
 //                              v12/v13 2nd-SHA pad, v14/v15 IV
+//     v2/v3/v20/v21 are not used as save copies on this path. The dual-lane
+//     tail adds v8/v9 (midstate) and v14/v15 (IV) in place. Single-lane
+//     leftover still keeps its own save copies. No third lane: the freed
+//     regs are not enough to hold another W/state/tmp set without evicting
+//     the cached midstate, IV, or pad.
+//   - Dual-lane schedule: the next group's SU0 issues before sha256h (H
+//     latency covers it) and SU1 sits between sha256h and sha256h2. The next
+//     K window ld1 is after the add that consumed v31, still under that hash.
+//     First-SHA rounds 4–15 share one WK (only W3/nonce differs per lane).
 //   - Nonce splice: fixed block1 words pre-REV32'd; only W3 updated per nonce
 //   - Second-SHA (item 2) — precomputed vs per-nonce:
 //       PRECOMPUTED / shared across nonces + lanes:
@@ -317,22 +325,19 @@ _sha256d_mine_midstate:
     b.eq    Lmine_single
 
 Lmine_dual_loop:
-    // Need at least 2 nonces
+    // Need at least 2 nonces. Schedule: next group's SU0 issues before
+    // sha256h and SU1 between sha256h and sha256h2. K ld1 for the next
+    // window is after the add that consumed v31. Midstate/IV are added
+    // from v8/v9 and v14/v15 — no save copies in v2/v3/v20/v21.
+    // First-SHA rounds 4–15 share one WK (only W3 differs per lane).
     cmp     w22, #2
     b.lo    Lmine_single
-
-    // ---- Setup lane A (nonce) and lane B (nonce+1) ----
-    // Midstate -> working + save
+    // Working state from cached midstate (v8/v9). Both lanes.
     mov     v0.16b, v8.16b
     mov     v1.16b, v9.16b
-    mov     v2.16b, v8.16b
-    mov     v3.16b, v9.16b
     mov     v18.16b, v8.16b
     mov     v19.16b, v9.16b
-    mov     v20.16b, v8.16b
-    mov     v21.16b, v9.16b
-
-    // W template + splice W3
+    // W template + nonce splice into W3 only.
     ld1     {v4.4s, v5.4s, v6.4s, v7.4s}, [x20]
     ld1     {v22.4s, v23.4s, v24.4s, v25.4s}, [x20]
     rev     w8, w21
@@ -340,7 +345,7 @@ Lmine_dual_loop:
     add     w9, w21, #1
     rev     w8, w9
     mov     v22.s[3], w8
-    // first-SHA: dual-lane compress, K window from x25/LK256
+    // ---- first SHA (block1) ----
     mov     x9, x25
     ld1     {v28.4s, v29.4s, v30.4s, v31.4s}, [x9], #64
     add     v16.4s, v4.4s, v28.4s
@@ -352,168 +357,163 @@ Lmine_dual_loop:
     sha256h2 q1, q17, v16.4s
     sha256h2 q19, q27, v26.4s
     add     v16.4s, v5.4s, v29.4s
-    add     v26.4s, v23.4s, v29.4s
     mov     v17.16b, v0.16b
     mov     v27.16b, v18.16b
     sha256h q0, q1, v16.4s
-    sha256h q18, q19, v26.4s
+    sha256h q18, q19, v16.4s
     sha256h2 q1, q17, v16.4s
-    sha256h2 q19, q27, v26.4s
+    sha256h2 q19, q27, v16.4s
     add     v16.4s, v6.4s, v30.4s
-    add     v26.4s, v24.4s, v30.4s
     mov     v17.16b, v0.16b
     mov     v27.16b, v18.16b
     sha256h q0, q1, v16.4s
-    sha256h q18, q19, v26.4s
+    sha256h q18, q19, v16.4s
     sha256h2 q1, q17, v16.4s
-    sha256h2 q19, q27, v26.4s
+    sha256h2 q19, q27, v16.4s
     add     v16.4s, v7.4s, v31.4s
-    add     v26.4s, v25.4s, v31.4s
     mov     v17.16b, v0.16b
     mov     v27.16b, v18.16b
-    sha256h q0, q1, v16.4s
-    sha256h q18, q19, v26.4s
-    sha256h2 q1, q17, v16.4s
-    sha256h2 q19, q27, v26.4s
     ld1     {v28.4s, v29.4s, v30.4s, v31.4s}, [x9], #64
     sha256su0 v4.4s, v5.4s
     sha256su0 v22.4s, v23.4s
+    sha256h q0, q1, v16.4s
+    sha256h q18, q19, v16.4s
     sha256su1 v4.4s, v6.4s, v7.4s
     sha256su1 v22.4s, v24.4s, v25.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h2 q19, q27, v16.4s
     add     v16.4s, v4.4s, v28.4s
     add     v26.4s, v22.4s, v28.4s
     mov     v17.16b, v0.16b
     mov     v27.16b, v18.16b
-    sha256h q0, q1, v16.4s
-    sha256h q18, q19, v26.4s
-    sha256h2 q1, q17, v16.4s
-    sha256h2 q19, q27, v26.4s
     sha256su0 v5.4s, v6.4s
     sha256su0 v23.4s, v24.4s
+    sha256h q0, q1, v16.4s
+    sha256h q18, q19, v26.4s
     sha256su1 v5.4s, v7.4s, v4.4s
     sha256su1 v23.4s, v25.4s, v22.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h2 q19, q27, v26.4s
     add     v16.4s, v5.4s, v29.4s
     add     v26.4s, v23.4s, v29.4s
     mov     v17.16b, v0.16b
     mov     v27.16b, v18.16b
     sha256h q0, q1, v16.4s
     sha256h q18, q19, v26.4s
-    sha256h2 q1, q17, v16.4s
-    sha256h2 q19, q27, v26.4s
-    // W24–27: sha256su0 on zero/pad W8–15 is a no-op (σ0 terms vanish);
-    // keep vectors as-is and let SU1 apply the digest-dependent terms.
     sha256su1 v6.4s, v4.4s, v5.4s
     sha256su1 v24.4s, v22.4s, v23.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h2 q19, q27, v26.4s
     add     v16.4s, v6.4s, v30.4s
     add     v26.4s, v24.4s, v30.4s
     mov     v17.16b, v0.16b
     mov     v27.16b, v18.16b
-    sha256h q0, q1, v16.4s
-    sha256h q18, q19, v26.4s
-    sha256h2 q1, q17, v16.4s
-    sha256h2 q19, q27, v26.4s
     sha256su0 v7.4s, v4.4s
     sha256su0 v25.4s, v22.4s
+    sha256h q0, q1, v16.4s
+    sha256h q18, q19, v26.4s
     sha256su1 v7.4s, v5.4s, v6.4s
     sha256su1 v25.4s, v23.4s, v24.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h2 q19, q27, v26.4s
     add     v16.4s, v7.4s, v31.4s
     add     v26.4s, v25.4s, v31.4s
     mov     v17.16b, v0.16b
     mov     v27.16b, v18.16b
-    sha256h q0, q1, v16.4s
-    sha256h q18, q19, v26.4s
-    sha256h2 q1, q17, v16.4s
-    sha256h2 q19, q27, v26.4s
     ld1     {v28.4s, v29.4s, v30.4s, v31.4s}, [x9], #64
     sha256su0 v4.4s, v5.4s
     sha256su0 v22.4s, v23.4s
+    sha256h q0, q1, v16.4s
+    sha256h q18, q19, v26.4s
     sha256su1 v4.4s, v6.4s, v7.4s
     sha256su1 v22.4s, v24.4s, v25.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h2 q19, q27, v26.4s
     add     v16.4s, v4.4s, v28.4s
     add     v26.4s, v22.4s, v28.4s
     mov     v17.16b, v0.16b
     mov     v27.16b, v18.16b
-    sha256h q0, q1, v16.4s
-    sha256h q18, q19, v26.4s
-    sha256h2 q1, q17, v16.4s
-    sha256h2 q19, q27, v26.4s
     sha256su0 v5.4s, v6.4s
     sha256su0 v23.4s, v24.4s
+    sha256h q0, q1, v16.4s
+    sha256h q18, q19, v26.4s
     sha256su1 v5.4s, v7.4s, v4.4s
     sha256su1 v23.4s, v25.4s, v22.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h2 q19, q27, v26.4s
     add     v16.4s, v5.4s, v29.4s
     add     v26.4s, v23.4s, v29.4s
     mov     v17.16b, v0.16b
     mov     v27.16b, v18.16b
-    sha256h q0, q1, v16.4s
-    sha256h q18, q19, v26.4s
-    sha256h2 q1, q17, v16.4s
-    sha256h2 q19, q27, v26.4s
     sha256su0 v6.4s, v7.4s
     sha256su0 v24.4s, v25.4s
+    sha256h q0, q1, v16.4s
+    sha256h q18, q19, v26.4s
     sha256su1 v6.4s, v4.4s, v5.4s
     sha256su1 v24.4s, v22.4s, v23.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h2 q19, q27, v26.4s
     add     v16.4s, v6.4s, v30.4s
     add     v26.4s, v24.4s, v30.4s
     mov     v17.16b, v0.16b
     mov     v27.16b, v18.16b
-    sha256h q0, q1, v16.4s
-    sha256h q18, q19, v26.4s
-    sha256h2 q1, q17, v16.4s
-    sha256h2 q19, q27, v26.4s
     sha256su0 v7.4s, v4.4s
     sha256su0 v25.4s, v22.4s
+    sha256h q0, q1, v16.4s
+    sha256h q18, q19, v26.4s
     sha256su1 v7.4s, v5.4s, v6.4s
     sha256su1 v25.4s, v23.4s, v24.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h2 q19, q27, v26.4s
     add     v16.4s, v7.4s, v31.4s
     add     v26.4s, v25.4s, v31.4s
     mov     v17.16b, v0.16b
     mov     v27.16b, v18.16b
-    sha256h q0, q1, v16.4s
-    sha256h q18, q19, v26.4s
-    sha256h2 q1, q17, v16.4s
-    sha256h2 q19, q27, v26.4s
     ld1     {v28.4s, v29.4s, v30.4s, v31.4s}, [x9]
     sha256su0 v4.4s, v5.4s
     sha256su0 v22.4s, v23.4s
+    sha256h q0, q1, v16.4s
+    sha256h q18, q19, v26.4s
     sha256su1 v4.4s, v6.4s, v7.4s
     sha256su1 v22.4s, v24.4s, v25.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h2 q19, q27, v26.4s
     add     v16.4s, v4.4s, v28.4s
     add     v26.4s, v22.4s, v28.4s
     mov     v17.16b, v0.16b
     mov     v27.16b, v18.16b
-    sha256h q0, q1, v16.4s
-    sha256h q18, q19, v26.4s
-    sha256h2 q1, q17, v16.4s
-    sha256h2 q19, q27, v26.4s
     sha256su0 v5.4s, v6.4s
     sha256su0 v23.4s, v24.4s
+    sha256h q0, q1, v16.4s
+    sha256h q18, q19, v26.4s
     sha256su1 v5.4s, v7.4s, v4.4s
     sha256su1 v23.4s, v25.4s, v22.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h2 q19, q27, v26.4s
     add     v16.4s, v5.4s, v29.4s
     add     v26.4s, v23.4s, v29.4s
     mov     v17.16b, v0.16b
     mov     v27.16b, v18.16b
-    sha256h q0, q1, v16.4s
-    sha256h q18, q19, v26.4s
-    sha256h2 q1, q17, v16.4s
-    sha256h2 q19, q27, v26.4s
     sha256su0 v6.4s, v7.4s
     sha256su0 v24.4s, v25.4s
+    sha256h q0, q1, v16.4s
+    sha256h q18, q19, v26.4s
     sha256su1 v6.4s, v4.4s, v5.4s
     sha256su1 v24.4s, v22.4s, v23.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h2 q19, q27, v26.4s
     add     v16.4s, v6.4s, v30.4s
     add     v26.4s, v24.4s, v30.4s
     mov     v17.16b, v0.16b
     mov     v27.16b, v18.16b
-    sha256h q0, q1, v16.4s
-    sha256h q18, q19, v26.4s
-    sha256h2 q1, q17, v16.4s
-    sha256h2 q19, q27, v26.4s
     sha256su0 v7.4s, v4.4s
     sha256su0 v25.4s, v22.4s
+    sha256h q0, q1, v16.4s
+    sha256h q18, q19, v26.4s
     sha256su1 v7.4s, v5.4s, v6.4s
     sha256su1 v25.4s, v23.4s, v24.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h2 q19, q27, v26.4s
     add     v16.4s, v7.4s, v31.4s
     add     v26.4s, v25.4s, v31.4s
     mov     v17.16b, v0.16b
@@ -522,16 +522,15 @@ Lmine_dual_loop:
     sha256h q18, q19, v26.4s
     sha256h2 q1, q17, v16.4s
     sha256h2 q19, q27, v26.4s
-    // Item 2 bridge: reload K0–15 while finalizing first-SHA digests
-    // (v28–31 free after last round-group). Pad/IV already cached.
     mov     x9, x25
-    add     v0.4s, v0.4s, v2.4s
+    // Bridge: fold midstate, reload K0–15 under those adds.
+    add     v0.4s, v0.4s, v8.4s
     ld1     {v28.4s, v29.4s, v30.4s, v31.4s}, [x9], #64
-    add     v1.4s, v1.4s, v3.4s
-    add     v18.4s, v18.4s, v20.4s
-    add     v19.4s, v19.4s, v21.4s
-
-    // Pack digests → W0–W7; shared fixed pad → W8–W15; IV → state+save
+    add     v1.4s, v1.4s, v9.4s
+    add     v18.4s, v18.4s, v8.4s
+    add     v19.4s, v19.4s, v9.4s
+    // Digest -> W0–W7, cached pad -> W8–W15, cached IV -> state.
+    // ---- second SHA ----
     mov     v4.16b, v0.16b
     mov     v5.16b, v1.16b
     mov     v22.16b, v18.16b
@@ -542,14 +541,8 @@ Lmine_dual_loop:
     mov     v25.16b, v13.16b
     mov     v0.16b, v14.16b
     mov     v1.16b, v15.16b
-    mov     v2.16b, v14.16b
-    mov     v3.16b, v15.16b
     mov     v18.16b, v14.16b
     mov     v19.16b, v15.16b
-    mov     v20.16b, v14.16b
-    mov     v21.16b, v15.16b
-
-    // second-SHA rounds 0–7: per-nonce digest W; dual-lane interleave
     add     v16.4s, v4.4s, v28.4s
     add     v26.4s, v22.4s, v28.4s
     mov     v17.16b, v0.16b
@@ -566,7 +559,6 @@ Lmine_dual_loop:
     sha256h q18, q19, v26.4s
     sha256h2 q1, q17, v16.4s
     sha256h2 q19, q27, v26.4s
-    // rounds 8–15: fixed pad W — one shared WK feeds both lanes
     add     v16.4s, v6.4s, v30.4s
     mov     v17.16b, v0.16b
     mov     v27.16b, v18.16b
@@ -577,149 +569,147 @@ Lmine_dual_loop:
     add     v16.4s, v7.4s, v31.4s
     mov     v17.16b, v0.16b
     mov     v27.16b, v18.16b
-    sha256h q0, q1, v16.4s
-    sha256h q18, q19, v16.4s
-    sha256h2 q1, q17, v16.4s
-    sha256h2 q19, q27, v16.4s
     ld1     {v28.4s, v29.4s, v30.4s, v31.4s}, [x9], #64
     sha256su0 v4.4s, v5.4s
     sha256su0 v22.4s, v23.4s
+    sha256h q0, q1, v16.4s
+    sha256h q18, q19, v16.4s
     sha256su1 v4.4s, v6.4s, v7.4s
     sha256su1 v22.4s, v24.4s, v25.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h2 q19, q27, v16.4s
     add     v16.4s, v4.4s, v28.4s
     add     v26.4s, v22.4s, v28.4s
     mov     v17.16b, v0.16b
     mov     v27.16b, v18.16b
-    sha256h q0, q1, v16.4s
-    sha256h q18, q19, v26.4s
-    sha256h2 q1, q17, v16.4s
-    sha256h2 q19, q27, v26.4s
     sha256su0 v5.4s, v6.4s
     sha256su0 v23.4s, v24.4s
+    sha256h q0, q1, v16.4s
+    sha256h q18, q19, v26.4s
     sha256su1 v5.4s, v7.4s, v4.4s
     sha256su1 v23.4s, v25.4s, v22.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h2 q19, q27, v26.4s
     add     v16.4s, v5.4s, v29.4s
     add     v26.4s, v23.4s, v29.4s
     mov     v17.16b, v0.16b
     mov     v27.16b, v18.16b
     sha256h q0, q1, v16.4s
     sha256h q18, q19, v26.4s
-    sha256h2 q1, q17, v16.4s
-    sha256h2 q19, q27, v26.4s
-    // W24–27: sha256su0 on zero/pad W8–15 is a no-op (σ0 terms vanish);
-    // keep vectors as-is and let SU1 apply the digest-dependent terms.
     sha256su1 v6.4s, v4.4s, v5.4s
     sha256su1 v24.4s, v22.4s, v23.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h2 q19, q27, v26.4s
     add     v16.4s, v6.4s, v30.4s
     add     v26.4s, v24.4s, v30.4s
     mov     v17.16b, v0.16b
     mov     v27.16b, v18.16b
-    sha256h q0, q1, v16.4s
-    sha256h q18, q19, v26.4s
-    sha256h2 q1, q17, v16.4s
-    sha256h2 q19, q27, v26.4s
     sha256su0 v7.4s, v4.4s
     sha256su0 v25.4s, v22.4s
+    sha256h q0, q1, v16.4s
+    sha256h q18, q19, v26.4s
     sha256su1 v7.4s, v5.4s, v6.4s
     sha256su1 v25.4s, v23.4s, v24.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h2 q19, q27, v26.4s
     add     v16.4s, v7.4s, v31.4s
     add     v26.4s, v25.4s, v31.4s
     mov     v17.16b, v0.16b
     mov     v27.16b, v18.16b
-    sha256h q0, q1, v16.4s
-    sha256h q18, q19, v26.4s
-    sha256h2 q1, q17, v16.4s
-    sha256h2 q19, q27, v26.4s
     ld1     {v28.4s, v29.4s, v30.4s, v31.4s}, [x9], #64
     sha256su0 v4.4s, v5.4s
     sha256su0 v22.4s, v23.4s
+    sha256h q0, q1, v16.4s
+    sha256h q18, q19, v26.4s
     sha256su1 v4.4s, v6.4s, v7.4s
     sha256su1 v22.4s, v24.4s, v25.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h2 q19, q27, v26.4s
     add     v16.4s, v4.4s, v28.4s
     add     v26.4s, v22.4s, v28.4s
     mov     v17.16b, v0.16b
     mov     v27.16b, v18.16b
-    sha256h q0, q1, v16.4s
-    sha256h q18, q19, v26.4s
-    sha256h2 q1, q17, v16.4s
-    sha256h2 q19, q27, v26.4s
     sha256su0 v5.4s, v6.4s
     sha256su0 v23.4s, v24.4s
+    sha256h q0, q1, v16.4s
+    sha256h q18, q19, v26.4s
     sha256su1 v5.4s, v7.4s, v4.4s
     sha256su1 v23.4s, v25.4s, v22.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h2 q19, q27, v26.4s
     add     v16.4s, v5.4s, v29.4s
     add     v26.4s, v23.4s, v29.4s
     mov     v17.16b, v0.16b
     mov     v27.16b, v18.16b
-    sha256h q0, q1, v16.4s
-    sha256h q18, q19, v26.4s
-    sha256h2 q1, q17, v16.4s
-    sha256h2 q19, q27, v26.4s
     sha256su0 v6.4s, v7.4s
     sha256su0 v24.4s, v25.4s
+    sha256h q0, q1, v16.4s
+    sha256h q18, q19, v26.4s
     sha256su1 v6.4s, v4.4s, v5.4s
     sha256su1 v24.4s, v22.4s, v23.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h2 q19, q27, v26.4s
     add     v16.4s, v6.4s, v30.4s
     add     v26.4s, v24.4s, v30.4s
     mov     v17.16b, v0.16b
     mov     v27.16b, v18.16b
-    sha256h q0, q1, v16.4s
-    sha256h q18, q19, v26.4s
-    sha256h2 q1, q17, v16.4s
-    sha256h2 q19, q27, v26.4s
     sha256su0 v7.4s, v4.4s
     sha256su0 v25.4s, v22.4s
+    sha256h q0, q1, v16.4s
+    sha256h q18, q19, v26.4s
     sha256su1 v7.4s, v5.4s, v6.4s
     sha256su1 v25.4s, v23.4s, v24.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h2 q19, q27, v26.4s
     add     v16.4s, v7.4s, v31.4s
     add     v26.4s, v25.4s, v31.4s
     mov     v17.16b, v0.16b
     mov     v27.16b, v18.16b
-    sha256h q0, q1, v16.4s
-    sha256h q18, q19, v26.4s
-    sha256h2 q1, q17, v16.4s
-    sha256h2 q19, q27, v26.4s
     ld1     {v28.4s, v29.4s, v30.4s, v31.4s}, [x9]
     sha256su0 v4.4s, v5.4s
     sha256su0 v22.4s, v23.4s
+    sha256h q0, q1, v16.4s
+    sha256h q18, q19, v26.4s
     sha256su1 v4.4s, v6.4s, v7.4s
     sha256su1 v22.4s, v24.4s, v25.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h2 q19, q27, v26.4s
     add     v16.4s, v4.4s, v28.4s
     add     v26.4s, v22.4s, v28.4s
     mov     v17.16b, v0.16b
     mov     v27.16b, v18.16b
-    sha256h q0, q1, v16.4s
-    sha256h q18, q19, v26.4s
-    sha256h2 q1, q17, v16.4s
-    sha256h2 q19, q27, v26.4s
     sha256su0 v5.4s, v6.4s
     sha256su0 v23.4s, v24.4s
+    sha256h q0, q1, v16.4s
+    sha256h q18, q19, v26.4s
     sha256su1 v5.4s, v7.4s, v4.4s
     sha256su1 v23.4s, v25.4s, v22.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h2 q19, q27, v26.4s
     add     v16.4s, v5.4s, v29.4s
     add     v26.4s, v23.4s, v29.4s
     mov     v17.16b, v0.16b
     mov     v27.16b, v18.16b
-    sha256h q0, q1, v16.4s
-    sha256h q18, q19, v26.4s
-    sha256h2 q1, q17, v16.4s
-    sha256h2 q19, q27, v26.4s
     sha256su0 v6.4s, v7.4s
     sha256su0 v24.4s, v25.4s
+    sha256h q0, q1, v16.4s
+    sha256h q18, q19, v26.4s
     sha256su1 v6.4s, v4.4s, v5.4s
     sha256su1 v24.4s, v22.4s, v23.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h2 q19, q27, v26.4s
     add     v16.4s, v6.4s, v30.4s
     add     v26.4s, v24.4s, v30.4s
     mov     v17.16b, v0.16b
     mov     v27.16b, v18.16b
-    sha256h q0, q1, v16.4s
-    sha256h q18, q19, v26.4s
-    sha256h2 q1, q17, v16.4s
-    sha256h2 q19, q27, v26.4s
     sha256su0 v7.4s, v4.4s
     sha256su0 v25.4s, v22.4s
+    sha256h q0, q1, v16.4s
+    sha256h q18, q19, v26.4s
     sha256su1 v7.4s, v5.4s, v6.4s
     sha256su1 v25.4s, v23.4s, v24.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h2 q19, q27, v26.4s
     add     v16.4s, v7.4s, v31.4s
     add     v26.4s, v25.4s, v31.4s
     mov     v17.16b, v0.16b
@@ -728,31 +718,27 @@ Lmine_dual_loop:
     sha256h q18, q19, v26.4s
     sha256h2 q1, q17, v16.4s
     sha256h2 q19, q27, v26.4s
-    add     v0.4s, v0.4s, v2.4s
-    add     v1.4s, v1.4s, v3.4s
-    add     v18.4s, v18.4s, v20.4s
-    add     v19.4s, v19.4s, v21.4s
-
-    // Compare lane A then lane B (earliest nonce wins)
+    // Tail: lane A compare overlaps lane B's IV add. Earliest nonce wins.
+    add     v0.4s, v0.4s, v14.4s
+    add     v1.4s, v1.4s, v15.4s
     eor     v16.16b, v0.16b, v10.16b
+    add     v18.4s, v18.4s, v14.4s
     eor     v17.16b, v1.16b, v11.16b
+    add     v19.4s, v19.4s, v15.4s
     orr     v16.16b, v16.16b, v17.16b
     umaxv   s16, v16.4s
     fmov    w8, s16
     cbz     w8, Lmine_hit_A
-
     eor     v16.16b, v18.16b, v10.16b
     eor     v17.16b, v19.16b, v11.16b
     orr     v16.16b, v16.16b, v17.16b
     umaxv   s16, v16.4s
     fmov    w8, s16
     cbz     w8, Lmine_hit_B
-
     add     w21, w21, #2
     sub     w22, w22, #2
     cbnz    w22, Lmine_dual_loop
     b       Lmine_miss
-
 Lmine_hit_A:
     str     w21, [x24]
     mov     w0, #1
