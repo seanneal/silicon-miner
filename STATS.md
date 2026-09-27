@@ -125,7 +125,7 @@ Landed on `main` (PR #1 squash merge `86fe9cf`, 2026-09-26). TIME_SPLIT accounti
 | E4 | Job midstate staging while hashing | eng | Done / soak saw `staged_overlap=1` |
 | E5 | Async share submit | eng | Done / soak exercised path |
 | E6 | `exp/sha-pipe-schedule` | **formal experiment fork** | Not started |
-| E7 | `exp/dual-job` | **formal experiment fork** | Fork open (`--dual-job off` or `on`). Not on main. Mac cells in section 13 are PLACEHOLDER. |
+| E7 | `exp/dual-job` | **formal experiment fork** | Measured 2026-09-27 CT (MacBookPro18,3, HEAD `7e8f4e7`). Draft PR #13 open. Not merged. Leave unmerged until Emshon decides. |
 
 Protocol: E6 and E7 each get their own branch, measure, and decision. Do not stack them.
 
@@ -509,30 +509,94 @@ Correctness (not throughput): qemu-aarch64 self-test **PASS** for `--dual-job of
 
 ### Results (MacBookPro18,3)
 
-Coordinator fills these cells. Do not copy qemu H/s into them.
+Measured 2026-09-27 CT, HEAD `7e8f4e7b581d5effff240fd883f3ff1829768b8b`. Default threads are 8 (`hw.physicalcpu`). qemu H/s is not in these cells. Energy was not measured.
 
-| Mode | Offline timed batch H/s | Offline soak 120 s H/s | Live tn3 120 s H/s | `TIME_SPLIT` other % | `idle_s` | switches | underfeed | install_while_live |
-|------|-------------------------|------------------------|--------------------|----------------------|----------|----------|-----------|--------------------|
-| control `--dual-job off` | PLACEHOLDER | PLACEHOLDER | PLACEHOLDER | PLACEHOLDER | n/a | n/a | n/a | n/a |
-| treatment `--dual-job on` | PLACEHOLDER | PLACEHOLDER | PLACEHOLDER | PLACEHOLDER | PLACEHOLDER | PLACEHOLDER | PLACEHOLDER | PLACEHOLDER |
+Summary (default 8T). Timed-batch `other` / `idle_s` / switches are the 8T treatment `DUAL_JOB` line; soak and live `other` are that run's `TIME_SPLIT` other.
+
+| Mode | Offline timed batch H/s | Offline soak 120 s H/s | Live tn3 120 s H/s | `TIME_SPLIT` other % (soak / live) | `idle_s` (timed / soak / live) | switches (timed / soak / live) | underfeed | install_while_live (timed / soak / live) |
+|------|-------------------------|------------------------|--------------------|-----------------------------------|--------------------------------|--------------------------------|-----------|------------------------------------------|
+| control `--dual-job off` | 75171014 (~75.2 MH/s) | 101124149 (~101.1 MH/s) | 68997622 (~69.0 MH/s) | 0.71% / 0.34% | n/a | n/a | n/a | n/a |
+| treatment `--dual-job on` | 93707539 (~93.7 MH/s, +24.7%) | 125091135 (~125.1 MH/s, +23.70%) | 100343446 (~100.3 MH/s, +45.43% vs this control) | 17.35% / 4.91% | 0.0000 / 20.8258 / 5.9124 | 1 / 77768 / 85892 | 0 / 0 / 0 | 0 / 0 / 4 |
 
 | Energy | control | treatment |
 |--------|---------|-----------|
-| `ABS_PKG_W` | PLACEHOLDER | PLACEHOLDER |
-| `W_PER_HASH` | PLACEHOLDER | PLACEHOLDER |
-| `J_PER_HASH` | PLACEHOLDER | PLACEHOLDER |
+| `ABS_PKG_W` | not measured | not measured |
+| `W_PER_HASH` | not measured | not measured |
+| `J_PER_HASH` | not measured | not measured |
 
-Live harness lines (paste; do not invent):
+#### Offline timed 2M
+
+| Mode | H/s | vs paired control |
+|------|-----|-------------------|
+| control 1T `--dual-job off` | **24203112** | — |
+| treatment 1T `--dual-job on` | **24102193** | **−0.42%** (flat) |
+| control default 8T `--dual-job off` | **75171014** (~75.2 MH/s) | — |
+| treatment default 8T `--dual-job on` | **93707539** (~93.7 MH/s) | **+24.7%** (short-bench noise; prefer the soaks) |
+
+8T treatment:
+
+```
+DUAL_JOB mode=on slots=2 switches=1 underfeed=0 install_while_live=0 idle_s=0.0000
+```
+
+#### Offline soak 120 s, default 8T
+
+| Mode | SOAK_AVG_H/s | `TIME_SPLIT` other | BATCHES | `DUAL_JOB` |
+|------|--------------|--------------------|---------|------------|
+| `--dual-job off` | **101124149** (~101.1 MH/s) | **0.71%** | started=**11573** early_share=**0** full=**11573** | n/a |
+| `--dual-job on` | **125091135** (~125.1 MH/s, **+23.70%**) | **17.35%** | started=**14317** early_share=**0** early_clean=**1** full=**14316** | switches=**77768** underfeed=**0** install_while_live=**0** idle_s=**20.8258** |
 
 ```
 control:
-TIME_SPLIT ...
-TIME_SPLIT_GAPS ...
-BATCHES ...
+SOAK_AVG_H/s=101124149
+TIME_SPLIT_PCT other=0.71
+BATCHES started=11573 early_share=0 full=11573
 
 treatment:
-TIME_SPLIT ...
-TIME_SPLIT_GAPS ...
-BATCHES ...
-DUAL_JOB mode=on slots=2 switches= PLACEHOLDER underfeed= PLACEHOLDER install_while_live= PLACEHOLDER idle_s= PLACEHOLDER
+SOAK_AVG_H/s=125091135
+TIME_SPLIT_PCT other=17.35
+BATCHES started=14317 early_share=0 early_clean=1 full=14316
+DUAL_JOB mode=on slots=2 switches=77768 underfeed=0 install_while_live=0 idle_s=20.8258
 ```
+
+#### Live tn3 120 s, `--suggest-diff 0.001`, default 8T, `caffeinate`
+
+```sh
+caffeinate -dims ./miner_test --dual-job off --testnet --seconds 120 --max-shares 0 --suggest-diff 0.001
+caffeinate -dims ./miner_test --dual-job on --testnet --seconds 120 --max-shares 0 --suggest-diff 0.001
+```
+
+| Field | control `--dual-job off` | treatment `--dual-job on` |
+|-------|--------------------------|---------------------------|
+| H/s | **68997622** (~69.0 MH/s) | **100343446** (~100.3 MH/s, **+45.43%** vs this control) |
+| Shares | **920** accepted / **924** submitted (**4** rejected) | **1489** accepted / **1492** submitted (**3** rejected) |
+| Jobs | seen=**6** staged=**5** | seen=**3** staged=**2** |
+| Difficulty | ended **0.16** | ended **0.16** |
+| `TIME_SPLIT_PCT` | hash=**87.38** share=**12.28** other=**0.34** | hash=**86.10** share=**8.99** other=**4.91** |
+| Gaps | wake_s=**0.1130** join_s=**0.1239** | wake_s=**0.0000** join_s=**0.0001** unexplained≈**5.8905** |
+| `BATCHES` | started=**3949** early_share=**0** early_clean=**3** full=**3946** avg_flight_s=**0.0303** hashes_per_flight=**2096948** | started=**5744** early_share=**0** early_clean=**4** full=**5740** avg_flight_s=**114.1216** hashes_per_flight=**2096532** |
+| Dual-job | `dual_job=off` | switches=**85892** underfeed=**0** install_while_live=**4** idle_s=**5.9124** |
+
+```
+control:
+TIME_SPLIT_PCT hash=87.38 share=12.28 other=0.34
+TIME_SPLIT_GAPS wake_s=0.1130 join_s=0.1239
+BATCHES started=3949 early_share=0 early_clean=3 full=3946 avg_flight_s=0.0303 hashes_per_flight=2096948
+dual_job=off
+
+treatment:
+TIME_SPLIT_PCT hash=86.10 share=8.99 other=4.91
+TIME_SPLIT_GAPS wake_s=0.0000 join_s=0.0001 unexplained≈5.8905
+BATCHES started=5744 early_share=0 early_clean=4 full=5740 avg_flight_s=114.1216 hashes_per_flight=2096532
+DUAL_JOB mode=on slots=2 switches=85892 underfeed=0 install_while_live=4 idle_s=5.9124
+```
+
+### Decision
+
+Offline soak (**+23.7%**, 101.1 → 125.1 MH/s) is the cleaner offline signal. The default-8T timed batch (**+24.7%**) is short-bench noise; the 1T pair was flat (**−0.42%**).
+
+Live treatment is **+45.43%** versus this control (69.0 → 100.3 MH/s; 68997622 → 100343446). This control sits below the section 12 Step 2 confirm (**80160173**, ~80.2 MH/s). Against that baseline, treatment is about **+25%** (~100.3 vs ~80.2).
+
+Treatment `TIME_SPLIT` / `BATCHES` show elevated `other` (soak **17.35%**, live **4.91%**), elevated `idle_s` (soak **20.8258**, live **5.9124**), and live `avg_flight_s`≈**114**. That is likely dual-job accounting skew: workers stay live across slot switches, so one flight covers the run. Treat it as an instrumentation caveat, not as proof that wall time was wasted. Live unexplained≈**5.8905** lines up with `idle_s`=**5.9124**. `underfeed` was **0** on the 8T timed batch, the offline soak, and the live soak.
+
+**Leave PR #13 unmerged** as a formal experiment until Emshon decides. Do not squash-merge it as ordinary engineering. Numbers recorded.

@@ -96,7 +96,7 @@ make testnet
 
 `--dual-job off` is the default and is the single-job path above. `--dual-job on` keeps **two midstate slots** live. A worker that finishes a slice claims whichever slot still has nonces, including the other header, without a join between those claims. The hash itself is still `_sha256d_mine_midstate` offline and `sha256d_asm_one` / `sha256_compress` on the testnet scan. A live share is queued and the slice finishes; it does not roll extranonce2. The target compare is the same one-word check as the single-job scan.
 
-This fork is an experiment. Do not squash-merge it as ordinary engineering. Measurement and empty Mac cells are in [STATS.md](STATS.md) section 13. qemu H/s is not an Apple Silicon result.
+This fork is an experiment. Do not squash-merge it as ordinary engineering. Mac results and the leave-unmerged decision are in [STATS.md](STATS.md) section 13. qemu H/s is not an Apple Silicon result.
 
 ```sh
 ./miner_test --dual-job off
