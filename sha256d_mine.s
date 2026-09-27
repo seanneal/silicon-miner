@@ -42,6 +42,8 @@
 //   _sha256d_mine_midstate(const uint32_t mid[8], const uint32_t w_be[16],
 //                          uint32_t nonce0, uint32_t count,
 //                          const uint32_t expect[8], uint32_t *found) -> w0: 1=found, 0=not
+//   _sha256d_mine_midstate_e6b — E6 schedule B, same arguments and return.
+//                          Baseline symbol above is schedule A (paired lanes).
 //
 .arch armv8-a+crypto
 .text
@@ -979,6 +981,726 @@ Lmine_miss:
     mov     w0, #0
 
 Lmine_epi:
+    ldp     q14, q15, [sp, #176]
+    ldp     q12, q13, [sp, #144]
+    ldp     q10, q11, [sp, #112]
+    ldp     q8, q9, [sp, #80]
+    ldr     x25, [sp, #64]
+    ldp     x23, x24, [sp, #48]
+    ldp     x21, x22, [sp, #32]
+    ldp     x19, x20, [sp, #16]
+    ldp     x29, x30, [sp], #208
+    ret
+
+//------------------------------------------------------------------------------
+// int _sha256d_mine_midstate_e6b(...)
+// E6 schedule B (formal experiment). Same signature, reg map, single-lane
+// leftover, and compare tail as _sha256d_mine_midstate. The dual-lane loop
+// is lane-major instead of paired:
+//   baseline A:  SU0_A, SU0_B, H_A, H_B, SU1_A, SU1_B, H2_A, H2_B
+//   schedule B:  SU0_A, H_A, SU1_A, H2_A, SU0_B, H_B, SU1_B, H2_B
+// Hash-only groups (no SU) are H_A, H2_A, H_B, H2_B.
+// Same instructions and operands; only issue order inside each round-group
+// changes. K ld1 stays with the group that consumes the new window.
+//------------------------------------------------------------------------------
+.globl _sha256d_mine_midstate_e6b
+.p2align 4
+_sha256d_mine_midstate_e6b:
+    // Frame layout (208 bytes):
+    //   [0]=x29,x30  [16]=x19,x20  [32]=x21,x22  [48]=x23,x24
+    //   [64]=x25     [80]=q8,q9  [112]=q10,q11  [144]=q12,q13  [176]=q14,q15
+    stp     x29, x30, [sp, #-208]!
+    mov     x29, sp
+    stp     x19, x20, [sp, #16]
+    stp     x21, x22, [sp, #32]
+    stp     x23, x24, [sp, #48]
+    str     x25, [sp, #64]
+    stp     q8, q9, [sp, #80]
+    stp     q10, q11, [sp, #112]
+    stp     q12, q13, [sp, #144]
+    stp     q14, q15, [sp, #176]
+
+    mov     x19, x0                     // midstate*
+    mov     x20, x1                     // w_be*
+    mov     w21, w2                     // nonce
+    mov     w22, w3                     // remaining
+    mov     x23, x4                     // expect* (also cached in NEON)
+    mov     x24, x5                     // found*
+
+    // LK256 base for K-window resets
+    adrp    x25, LK256@PAGE
+    add     x25, x25, LK256@PAGEOFF
+
+    // Cache midstate / expect / pad / IV in callee-saved v8–v15
+    ld1     {v8.4s, v9.4s}, [x19]
+    ld1     {v10.4s, v11.4s}, [x23]
+    adrp    x9, Lsha2_pad@PAGE
+    add     x9, x9, Lsha2_pad@PAGEOFF
+    ld1     {v12.4s, v13.4s}, [x9]
+    adrp    x9, Lsha_iv@PAGE
+    add     x9, x9, Lsha_iv@PAGEOFF
+    ld1     {v14.4s, v15.4s}, [x9]
+
+    cbz     w22, Le6b_miss
+    cmp     w22, #1
+    b.eq    Le6b_single
+
+Le6b_dual_loop:
+    // E6 schedule B. Same reg map and K window as the baseline loop.
+    // Each round-group finishes lane A (SU0, H, SU1, H2) before lane B,
+    // so H2 issues in the throughput slot after that lane's H instead of
+    // after both lanes' H and both SU1s. Hash-only groups are H, H2, H, H2.
+    // K ld1 stays after the add that consumed v31. Rounds 4–15 still share
+    // one WK. Single-lane leftover below is unchanged from the baseline.
+    cmp     w22, #2
+    b.lo    Le6b_single
+    // Working state from cached midstate (v8/v9). Both lanes.
+    mov     v0.16b, v8.16b
+    mov     v1.16b, v9.16b
+    mov     v18.16b, v8.16b
+    mov     v19.16b, v9.16b
+    // W template + nonce splice into W3 only.
+    ld1     {v4.4s, v5.4s, v6.4s, v7.4s}, [x20]
+    ld1     {v22.4s, v23.4s, v24.4s, v25.4s}, [x20]
+    rev     w8, w21
+    mov     v4.s[3], w8
+    add     w9, w21, #1
+    rev     w8, w9
+    mov     v22.s[3], w8
+    // ---- first SHA (block1) ----
+    mov     x9, x25
+    ld1     {v28.4s, v29.4s, v30.4s, v31.4s}, [x9], #64
+    add     v16.4s, v4.4s, v28.4s
+    add     v26.4s, v22.4s, v28.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h q18, q19, v26.4s
+    sha256h2 q19, q27, v26.4s
+    add     v16.4s, v5.4s, v29.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h q18, q19, v16.4s
+    sha256h2 q19, q27, v16.4s
+    add     v16.4s, v6.4s, v30.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h q18, q19, v16.4s
+    sha256h2 q19, q27, v16.4s
+    add     v16.4s, v7.4s, v31.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    ld1     {v28.4s, v29.4s, v30.4s, v31.4s}, [x9], #64
+    sha256su0 v4.4s, v5.4s
+    sha256h q0, q1, v16.4s
+    sha256su1 v4.4s, v6.4s, v7.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v22.4s, v23.4s
+    sha256h q18, q19, v16.4s
+    sha256su1 v22.4s, v24.4s, v25.4s
+    sha256h2 q19, q27, v16.4s
+    add     v16.4s, v4.4s, v28.4s
+    add     v26.4s, v22.4s, v28.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    sha256su0 v5.4s, v6.4s
+    sha256h q0, q1, v16.4s
+    sha256su1 v5.4s, v7.4s, v4.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v23.4s, v24.4s
+    sha256h q18, q19, v26.4s
+    sha256su1 v23.4s, v25.4s, v22.4s
+    sha256h2 q19, q27, v26.4s
+    add     v16.4s, v5.4s, v29.4s
+    add     v26.4s, v23.4s, v29.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    sha256h q0, q1, v16.4s
+    sha256su1 v6.4s, v4.4s, v5.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h q18, q19, v26.4s
+    sha256su1 v24.4s, v22.4s, v23.4s
+    sha256h2 q19, q27, v26.4s
+    add     v16.4s, v6.4s, v30.4s
+    add     v26.4s, v24.4s, v30.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    sha256su0 v7.4s, v4.4s
+    sha256h q0, q1, v16.4s
+    sha256su1 v7.4s, v5.4s, v6.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v25.4s, v22.4s
+    sha256h q18, q19, v26.4s
+    sha256su1 v25.4s, v23.4s, v24.4s
+    sha256h2 q19, q27, v26.4s
+    add     v16.4s, v7.4s, v31.4s
+    add     v26.4s, v25.4s, v31.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    ld1     {v28.4s, v29.4s, v30.4s, v31.4s}, [x9], #64
+    sha256su0 v4.4s, v5.4s
+    sha256h q0, q1, v16.4s
+    sha256su1 v4.4s, v6.4s, v7.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v22.4s, v23.4s
+    sha256h q18, q19, v26.4s
+    sha256su1 v22.4s, v24.4s, v25.4s
+    sha256h2 q19, q27, v26.4s
+    add     v16.4s, v4.4s, v28.4s
+    add     v26.4s, v22.4s, v28.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    sha256su0 v5.4s, v6.4s
+    sha256h q0, q1, v16.4s
+    sha256su1 v5.4s, v7.4s, v4.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v23.4s, v24.4s
+    sha256h q18, q19, v26.4s
+    sha256su1 v23.4s, v25.4s, v22.4s
+    sha256h2 q19, q27, v26.4s
+    add     v16.4s, v5.4s, v29.4s
+    add     v26.4s, v23.4s, v29.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    sha256su0 v6.4s, v7.4s
+    sha256h q0, q1, v16.4s
+    sha256su1 v6.4s, v4.4s, v5.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v24.4s, v25.4s
+    sha256h q18, q19, v26.4s
+    sha256su1 v24.4s, v22.4s, v23.4s
+    sha256h2 q19, q27, v26.4s
+    add     v16.4s, v6.4s, v30.4s
+    add     v26.4s, v24.4s, v30.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    sha256su0 v7.4s, v4.4s
+    sha256h q0, q1, v16.4s
+    sha256su1 v7.4s, v5.4s, v6.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v25.4s, v22.4s
+    sha256h q18, q19, v26.4s
+    sha256su1 v25.4s, v23.4s, v24.4s
+    sha256h2 q19, q27, v26.4s
+    add     v16.4s, v7.4s, v31.4s
+    add     v26.4s, v25.4s, v31.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    ld1     {v28.4s, v29.4s, v30.4s, v31.4s}, [x9]
+    sha256su0 v4.4s, v5.4s
+    sha256h q0, q1, v16.4s
+    sha256su1 v4.4s, v6.4s, v7.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v22.4s, v23.4s
+    sha256h q18, q19, v26.4s
+    sha256su1 v22.4s, v24.4s, v25.4s
+    sha256h2 q19, q27, v26.4s
+    add     v16.4s, v4.4s, v28.4s
+    add     v26.4s, v22.4s, v28.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    sha256su0 v5.4s, v6.4s
+    sha256h q0, q1, v16.4s
+    sha256su1 v5.4s, v7.4s, v4.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v23.4s, v24.4s
+    sha256h q18, q19, v26.4s
+    sha256su1 v23.4s, v25.4s, v22.4s
+    sha256h2 q19, q27, v26.4s
+    add     v16.4s, v5.4s, v29.4s
+    add     v26.4s, v23.4s, v29.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    sha256su0 v6.4s, v7.4s
+    sha256h q0, q1, v16.4s
+    sha256su1 v6.4s, v4.4s, v5.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v24.4s, v25.4s
+    sha256h q18, q19, v26.4s
+    sha256su1 v24.4s, v22.4s, v23.4s
+    sha256h2 q19, q27, v26.4s
+    add     v16.4s, v6.4s, v30.4s
+    add     v26.4s, v24.4s, v30.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    sha256su0 v7.4s, v4.4s
+    sha256h q0, q1, v16.4s
+    sha256su1 v7.4s, v5.4s, v6.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v25.4s, v22.4s
+    sha256h q18, q19, v26.4s
+    sha256su1 v25.4s, v23.4s, v24.4s
+    sha256h2 q19, q27, v26.4s
+    add     v16.4s, v7.4s, v31.4s
+    add     v26.4s, v25.4s, v31.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h q18, q19, v26.4s
+    sha256h2 q19, q27, v26.4s
+    mov     x9, x25
+    // Bridge: fold midstate, reload K0–15 under those adds.
+    add     v0.4s, v0.4s, v8.4s
+    ld1     {v28.4s, v29.4s, v30.4s, v31.4s}, [x9], #64
+    add     v1.4s, v1.4s, v9.4s
+    add     v18.4s, v18.4s, v8.4s
+    add     v19.4s, v19.4s, v9.4s
+    // Digest -> W0–W7, cached pad -> W8–W15, cached IV -> state.
+    // ---- second SHA ----
+    mov     v4.16b, v0.16b
+    mov     v5.16b, v1.16b
+    mov     v22.16b, v18.16b
+    mov     v23.16b, v19.16b
+    mov     v6.16b, v12.16b
+    mov     v7.16b, v13.16b
+    mov     v24.16b, v12.16b
+    mov     v25.16b, v13.16b
+    mov     v0.16b, v14.16b
+    mov     v1.16b, v15.16b
+    mov     v18.16b, v14.16b
+    mov     v19.16b, v15.16b
+    add     v16.4s, v4.4s, v28.4s
+    add     v26.4s, v22.4s, v28.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h q18, q19, v26.4s
+    sha256h2 q19, q27, v26.4s
+    add     v16.4s, v5.4s, v29.4s
+    add     v26.4s, v23.4s, v29.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h q18, q19, v26.4s
+    sha256h2 q19, q27, v26.4s
+    add     v16.4s, v6.4s, v30.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h q18, q19, v16.4s
+    sha256h2 q19, q27, v16.4s
+    add     v16.4s, v7.4s, v31.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    ld1     {v28.4s, v29.4s, v30.4s, v31.4s}, [x9], #64
+    sha256su0 v4.4s, v5.4s
+    sha256h q0, q1, v16.4s
+    sha256su1 v4.4s, v6.4s, v7.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v22.4s, v23.4s
+    sha256h q18, q19, v16.4s
+    sha256su1 v22.4s, v24.4s, v25.4s
+    sha256h2 q19, q27, v16.4s
+    add     v16.4s, v4.4s, v28.4s
+    add     v26.4s, v22.4s, v28.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    sha256su0 v5.4s, v6.4s
+    sha256h q0, q1, v16.4s
+    sha256su1 v5.4s, v7.4s, v4.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v23.4s, v24.4s
+    sha256h q18, q19, v26.4s
+    sha256su1 v23.4s, v25.4s, v22.4s
+    sha256h2 q19, q27, v26.4s
+    add     v16.4s, v5.4s, v29.4s
+    add     v26.4s, v23.4s, v29.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    sha256h q0, q1, v16.4s
+    sha256su1 v6.4s, v4.4s, v5.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h q18, q19, v26.4s
+    sha256su1 v24.4s, v22.4s, v23.4s
+    sha256h2 q19, q27, v26.4s
+    add     v16.4s, v6.4s, v30.4s
+    add     v26.4s, v24.4s, v30.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    sha256su0 v7.4s, v4.4s
+    sha256h q0, q1, v16.4s
+    sha256su1 v7.4s, v5.4s, v6.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v25.4s, v22.4s
+    sha256h q18, q19, v26.4s
+    sha256su1 v25.4s, v23.4s, v24.4s
+    sha256h2 q19, q27, v26.4s
+    add     v16.4s, v7.4s, v31.4s
+    add     v26.4s, v25.4s, v31.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    ld1     {v28.4s, v29.4s, v30.4s, v31.4s}, [x9], #64
+    sha256su0 v4.4s, v5.4s
+    sha256h q0, q1, v16.4s
+    sha256su1 v4.4s, v6.4s, v7.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v22.4s, v23.4s
+    sha256h q18, q19, v26.4s
+    sha256su1 v22.4s, v24.4s, v25.4s
+    sha256h2 q19, q27, v26.4s
+    add     v16.4s, v4.4s, v28.4s
+    add     v26.4s, v22.4s, v28.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    sha256su0 v5.4s, v6.4s
+    sha256h q0, q1, v16.4s
+    sha256su1 v5.4s, v7.4s, v4.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v23.4s, v24.4s
+    sha256h q18, q19, v26.4s
+    sha256su1 v23.4s, v25.4s, v22.4s
+    sha256h2 q19, q27, v26.4s
+    add     v16.4s, v5.4s, v29.4s
+    add     v26.4s, v23.4s, v29.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    sha256su0 v6.4s, v7.4s
+    sha256h q0, q1, v16.4s
+    sha256su1 v6.4s, v4.4s, v5.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v24.4s, v25.4s
+    sha256h q18, q19, v26.4s
+    sha256su1 v24.4s, v22.4s, v23.4s
+    sha256h2 q19, q27, v26.4s
+    add     v16.4s, v6.4s, v30.4s
+    add     v26.4s, v24.4s, v30.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    sha256su0 v7.4s, v4.4s
+    sha256h q0, q1, v16.4s
+    sha256su1 v7.4s, v5.4s, v6.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v25.4s, v22.4s
+    sha256h q18, q19, v26.4s
+    sha256su1 v25.4s, v23.4s, v24.4s
+    sha256h2 q19, q27, v26.4s
+    add     v16.4s, v7.4s, v31.4s
+    add     v26.4s, v25.4s, v31.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    ld1     {v28.4s, v29.4s, v30.4s, v31.4s}, [x9]
+    sha256su0 v4.4s, v5.4s
+    sha256h q0, q1, v16.4s
+    sha256su1 v4.4s, v6.4s, v7.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v22.4s, v23.4s
+    sha256h q18, q19, v26.4s
+    sha256su1 v22.4s, v24.4s, v25.4s
+    sha256h2 q19, q27, v26.4s
+    add     v16.4s, v4.4s, v28.4s
+    add     v26.4s, v22.4s, v28.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    sha256su0 v5.4s, v6.4s
+    sha256h q0, q1, v16.4s
+    sha256su1 v5.4s, v7.4s, v4.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v23.4s, v24.4s
+    sha256h q18, q19, v26.4s
+    sha256su1 v23.4s, v25.4s, v22.4s
+    sha256h2 q19, q27, v26.4s
+    add     v16.4s, v5.4s, v29.4s
+    add     v26.4s, v23.4s, v29.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    sha256su0 v6.4s, v7.4s
+    sha256h q0, q1, v16.4s
+    sha256su1 v6.4s, v4.4s, v5.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v24.4s, v25.4s
+    sha256h q18, q19, v26.4s
+    sha256su1 v24.4s, v22.4s, v23.4s
+    sha256h2 q19, q27, v26.4s
+    add     v16.4s, v6.4s, v30.4s
+    add     v26.4s, v24.4s, v30.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    sha256su0 v7.4s, v4.4s
+    sha256h q0, q1, v16.4s
+    sha256su1 v7.4s, v5.4s, v6.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v25.4s, v22.4s
+    sha256h q18, q19, v26.4s
+    sha256su1 v25.4s, v23.4s, v24.4s
+    sha256h2 q19, q27, v26.4s
+    add     v16.4s, v7.4s, v31.4s
+    add     v26.4s, v25.4s, v31.4s
+    mov     v17.16b, v0.16b
+    mov     v27.16b, v18.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    sha256h q18, q19, v26.4s
+    sha256h2 q19, q27, v26.4s
+    // Tail: lane A compare overlaps lane B's IV add. Earliest nonce wins.
+    add     v0.4s, v0.4s, v14.4s
+    add     v1.4s, v1.4s, v15.4s
+    eor     v16.16b, v0.16b, v10.16b
+    add     v18.4s, v18.4s, v14.4s
+    eor     v17.16b, v1.16b, v11.16b
+    add     v19.4s, v19.4s, v15.4s
+    orr     v16.16b, v16.16b, v17.16b
+    umaxv   s16, v16.4s
+    fmov    w8, s16
+    cbz     w8, Le6b_hit_A
+    eor     v16.16b, v18.16b, v10.16b
+    eor     v17.16b, v19.16b, v11.16b
+    orr     v16.16b, v16.16b, v17.16b
+    umaxv   s16, v16.4s
+    fmov    w8, s16
+    cbz     w8, Le6b_hit_B
+    add     w21, w21, #2
+    sub     w22, w22, #2
+    cbnz    w22, Le6b_dual_loop
+    b       Le6b_miss
+Le6b_hit_A:
+    str     w21, [x24]
+    mov     w0, #1
+    b       Le6b_epi
+
+Le6b_hit_B:
+    add     w8, w21, #1
+    str     w8, [x24]
+    mov     w0, #1
+    b       Le6b_epi
+
+//------------------------------------------------------------------------------
+// Single-lane leftover (count==1) or entry when only one nonce remains
+//------------------------------------------------------------------------------
+Le6b_single:
+    cbz     w22, Le6b_miss
+
+    mov     v0.16b, v8.16b
+    mov     v1.16b, v9.16b
+    mov     v2.16b, v8.16b
+    mov     v3.16b, v9.16b
+    ld1     {v4.4s, v5.4s, v6.4s, v7.4s}, [x20]
+    rev     w8, w21
+    mov     v4.s[3], w8
+    mov     x9, x25
+    ld1     {v28.4s, v29.4s, v30.4s, v31.4s}, [x9], #64
+    add     v16.4s, v4.4s, v28.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    add     v16.4s, v5.4s, v29.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    add     v16.4s, v6.4s, v30.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    add     v16.4s, v7.4s, v31.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    ld1     {v28.4s, v29.4s, v30.4s, v31.4s}, [x9], #64
+    sha256su0 v4.4s, v5.4s
+    sha256su1 v4.4s, v6.4s, v7.4s
+    add     v16.4s, v4.4s, v28.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v5.4s, v6.4s
+    sha256su1 v5.4s, v7.4s, v4.4s
+    add     v16.4s, v5.4s, v29.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    // W24–27: pad/zero SU0 no-op (see dual); SU1 only
+    sha256su1 v6.4s, v4.4s, v5.4s
+    add     v16.4s, v6.4s, v30.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v7.4s, v4.4s
+    sha256su1 v7.4s, v5.4s, v6.4s
+    add     v16.4s, v7.4s, v31.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    ld1     {v28.4s, v29.4s, v30.4s, v31.4s}, [x9], #64
+    sha256su0 v4.4s, v5.4s
+    sha256su1 v4.4s, v6.4s, v7.4s
+    add     v16.4s, v4.4s, v28.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v5.4s, v6.4s
+    sha256su1 v5.4s, v7.4s, v4.4s
+    add     v16.4s, v5.4s, v29.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v6.4s, v7.4s
+    sha256su1 v6.4s, v4.4s, v5.4s
+    add     v16.4s, v6.4s, v30.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v7.4s, v4.4s
+    sha256su1 v7.4s, v5.4s, v6.4s
+    add     v16.4s, v7.4s, v31.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    ld1     {v28.4s, v29.4s, v30.4s, v31.4s}, [x9]
+    sha256su0 v4.4s, v5.4s
+    sha256su1 v4.4s, v6.4s, v7.4s
+    add     v16.4s, v4.4s, v28.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v5.4s, v6.4s
+    sha256su1 v5.4s, v7.4s, v4.4s
+    add     v16.4s, v5.4s, v29.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v6.4s, v7.4s
+    sha256su1 v6.4s, v4.4s, v5.4s
+    add     v16.4s, v6.4s, v30.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v7.4s, v4.4s
+    sha256su1 v7.4s, v5.4s, v6.4s
+    add     v16.4s, v7.4s, v31.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    // Item 2 single: overlap K0–15 reload with digest finalize
+    mov     x9, x25
+    add     v0.4s, v0.4s, v2.4s
+    ld1     {v28.4s, v29.4s, v30.4s, v31.4s}, [x9], #64
+    add     v1.4s, v1.4s, v3.4s
+
+    mov     v4.16b, v0.16b
+    mov     v5.16b, v1.16b
+    mov     v6.16b, v12.16b
+    mov     v7.16b, v13.16b
+    mov     v0.16b, v14.16b
+    mov     v1.16b, v15.16b
+    mov     v2.16b, v14.16b
+    mov     v3.16b, v15.16b
+    add     v16.4s, v4.4s, v28.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    add     v16.4s, v5.4s, v29.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    add     v16.4s, v6.4s, v30.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    add     v16.4s, v7.4s, v31.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    ld1     {v28.4s, v29.4s, v30.4s, v31.4s}, [x9], #64
+    sha256su0 v4.4s, v5.4s
+    sha256su1 v4.4s, v6.4s, v7.4s
+    add     v16.4s, v4.4s, v28.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v5.4s, v6.4s
+    sha256su1 v5.4s, v7.4s, v4.4s
+    add     v16.4s, v5.4s, v29.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    // W24–27: pad/zero SU0 no-op (see dual); SU1 only
+    sha256su1 v6.4s, v4.4s, v5.4s
+    add     v16.4s, v6.4s, v30.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v7.4s, v4.4s
+    sha256su1 v7.4s, v5.4s, v6.4s
+    add     v16.4s, v7.4s, v31.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    ld1     {v28.4s, v29.4s, v30.4s, v31.4s}, [x9], #64
+    sha256su0 v4.4s, v5.4s
+    sha256su1 v4.4s, v6.4s, v7.4s
+    add     v16.4s, v4.4s, v28.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v5.4s, v6.4s
+    sha256su1 v5.4s, v7.4s, v4.4s
+    add     v16.4s, v5.4s, v29.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v6.4s, v7.4s
+    sha256su1 v6.4s, v4.4s, v5.4s
+    add     v16.4s, v6.4s, v30.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v7.4s, v4.4s
+    sha256su1 v7.4s, v5.4s, v6.4s
+    add     v16.4s, v7.4s, v31.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    ld1     {v28.4s, v29.4s, v30.4s, v31.4s}, [x9]
+    sha256su0 v4.4s, v5.4s
+    sha256su1 v4.4s, v6.4s, v7.4s
+    add     v16.4s, v4.4s, v28.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v5.4s, v6.4s
+    sha256su1 v5.4s, v7.4s, v4.4s
+    add     v16.4s, v5.4s, v29.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v6.4s, v7.4s
+    sha256su1 v6.4s, v4.4s, v5.4s
+    add     v16.4s, v6.4s, v30.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    sha256su0 v7.4s, v4.4s
+    sha256su1 v7.4s, v5.4s, v6.4s
+    add     v16.4s, v7.4s, v31.4s
+    mov     v17.16b, v0.16b
+    sha256h q0, q1, v16.4s
+    sha256h2 q1, q17, v16.4s
+    add     v0.4s, v0.4s, v2.4s
+    add     v1.4s, v1.4s, v3.4s
+
+    eor     v16.16b, v0.16b, v10.16b
+    eor     v17.16b, v1.16b, v11.16b
+    orr     v16.16b, v16.16b, v17.16b
+    umaxv   s16, v16.4s
+    fmov    w8, s16
+    cbz     w8, Le6b_hit_A
+
+    add     w21, w21, #1
+    sub     w22, w22, #1
+    cbnz    w22, Le6b_single
+
+Le6b_miss:
+    mov     w0, #0
+
+Le6b_epi:
     ldp     q14, q15, [sp, #176]
     ldp     q12, q13, [sp, #144]
     ldp     q10, q11, [sp, #112]

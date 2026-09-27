@@ -2,7 +2,8 @@
  * harness.c — C only outside the hash path.
  * Tests, timing, metrics glue, threads, and optional testnet Stratum mining loop.
  * Hash path remains pure ARM64 asm (sha256d_mine.s). Workers call
- * _sha256d_mine_midstate on disjoint nonce ranges. Stratum share checks are a
+ * _sha256d_mine_midstate (or _sha256d_mine_midstate_e6b when --sha-sched b)
+ * on disjoint nonce ranges. Stratum share checks are a
  * target inequality, so that loop partitions the same way and hashes each
  * slice with the existing asm compress (sha256d_asm_one). A live share is
  * queued and the slice finishes; it does not cancel siblings or roll
@@ -43,6 +44,38 @@ extern int  sha256d_mine_midstate(const uint32_t midstate[8],
                                   uint32_t nonce_count,
                                   const uint32_t expect[8],
                                   uint32_t *found_nonce);
+/* E6 schedule B. Same signature as sha256d_mine_midstate (schedule A). */
+extern int  sha256d_mine_midstate_e6b(const uint32_t midstate[8],
+                                     const uint32_t w_be[16],
+                                     uint32_t nonce_start,
+                                     uint32_t nonce_count,
+                                     const uint32_t expect[8],
+                                     uint32_t *found_nonce);
+
+/* 0 = schedule A (baseline, default). 1 = E6 schedule B. */
+static int g_sha_sched_b;
+
+static const char *sha_sched_name(void) {
+    return g_sha_sched_b ? "B" : "A";
+}
+
+static int sha_mine(const uint32_t midstate[8], const uint32_t w_be[16],
+                    uint32_t nonce_start, uint32_t nonce_count,
+                    const uint32_t expect[8], uint32_t *found_nonce) {
+    if (g_sha_sched_b) {
+        return sha256d_mine_midstate_e6b(midstate, w_be, nonce_start, nonce_count,
+                                        expect, found_nonce);
+    }
+    return sha256d_mine_midstate(midstate, w_be, nonce_start, nonce_count,
+                                 expect, found_nonce);
+}
+
+typedef int (*sha_mine_fn)(const uint32_t midstate[8],
+                           const uint32_t w_be[16],
+                           uint32_t nonce_start,
+                           uint32_t nonce_count,
+                           const uint32_t expect[8],
+                           uint32_t *found_nonce);
 
 static const uint32_t SHA_IV[8] = {
     0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
@@ -859,8 +892,8 @@ static void *mine_slice_worker(void *arg) {
         s->t_start_ns = mono_ns();
         t0 = mono_ticks();
     }
-    s->hit = sha256d_mine_midstate(s->mid, s->w_be, s->nonce_start, s->nonce_count,
-                                   s->expect, &found);
+    s->hit = sha_mine(s->mid, s->w_be, s->nonce_start, s->nonce_count,
+                      s->expect, &found);
     s->found = found;
     if (timing) {
         s->hash_ticks = mono_ticks() - t0;
@@ -1040,7 +1073,7 @@ static void account_scan_slices(const scan_slice_t *s, int n,
 
 /*
  * Equality-gated mine. threads<=1 (or a single slice) calls
- * sha256d_mine_midstate directly so the one-thread path stays the same.
+ * the selected schedule directly so the one-thread path stays one asm call.
  * On multiple hits, the earliest nonce in search order wins.
  */
 static int mine_midstate_n(const uint32_t mid[8], const uint32_t w_be[16],
@@ -1057,14 +1090,14 @@ static int mine_midstate_n(const uint32_t mid[8], const uint32_t w_be[16],
     if (used <= 1) {
         apply_worker_pin(0);
         if (!time_split_on()) {
-            return sha256d_mine_midstate(mid, w_be, nonce_start, nonce_count,
-                                         expect, found_nonce);
+            return sha_mine(mid, w_be, nonce_start, nonce_count,
+                             expect, found_nonce);
         }
         batch_count_begin();
         uint64_t t_start = mono_ns();
         uint64_t a = mono_ticks();
-        int hit = sha256d_mine_midstate(mid, w_be, nonce_start, nonce_count,
-                                        expect, found_nonce);
+        int hit = sha_mine(mid, w_be, nonce_start, nonce_count,
+                           expect, found_nonce);
         g_cpu_hash_ticks += mono_ticks() - a;
         uint64_t t_end = mono_ns();
         add_flight_wall(t_start, t_end);
@@ -1531,6 +1564,48 @@ static int selftest_target_equiv(void) {
     return 0;
 }
 
+/* Both schedules must find genesis nonce 0x7c2bac1d. Covers lane A, lane B,
+ * the dual-loop back-edge, the odd single-lane tail, a miss, and count==1.
+ * Runs before TIME_SPLIT is armed. */
+static int selftest_e6_schedules(const uint32_t mid[8], const uint32_t w_be[16]) {
+    struct {
+        sha_mine_fn fn;
+        const char *name;
+    } arms[2] = {
+        { sha256d_mine_midstate, "A" },
+        { sha256d_mine_midstate_e6b, "B" },
+    };
+    struct {
+        uint32_t start;
+        uint32_t count;
+        int want_hit;
+        const char *what;
+    } cases[] = {
+        { 0x7c2bac1du, 2, 1, "lane A" },
+        { 0x7c2bac1cu, 2, 1, "lane B" },
+        { 0x7c2bac1bu, 4, 1, "loop" },
+        /* Dual pair misses; the leftover single-lane nonce is genesis. */
+        { 0x7c2bac1bu, 3, 1, "odd tail" },
+        { 0u, 2, 0, "miss" },
+        { 0x7c2bac1du, 1, 1, "single" },
+    };
+    for (int a = 0; a < 2; a++) {
+        for (unsigned c = 0; c < sizeof cases / sizeof cases[0]; c++) {
+            uint32_t found = 0;
+            int hit = arms[a].fn(mid, w_be, cases[c].start, cases[c].count,
+                                 GENESIS_DIGEST, &found);
+            int found_ok = !cases[c].want_hit || found == 0x7c2bac1du;
+            if (hit != cases[c].want_hit || !found_ok) {
+                printf("SELFTEST: FAIL (E6 sched %s %s hit=%d found=%08x)\n",
+                       arms[a].name, cases[c].what, hit, found);
+                return 1;
+            }
+        }
+    }
+    printf("SELFTEST: E6 schedule A and B genesis OK (nonce=7c2bac1d)\n");
+    return 0;
+}
+
 static int run_selftest(int threads) {
     if (selftest_partition() != 0)
         return 1;
@@ -1572,6 +1647,9 @@ static int run_selftest(int threads) {
             return 1;
         }
     }
+
+    if (selftest_e6_schedules(mid, w_be) != 0)
+        return 1;
 
     time_split_reset();
     if (selftest_threaded_genesis(1) != 0)
@@ -2084,6 +2162,7 @@ static int run_soak(const uint32_t mid[8], const uint32_t w_be[16],
     printf("SOAK_AVG_H/s=%.0f\n", hs);
     printf("H/s=%.0f\n", hs);
     printf("threads=%d\n", threads);
+    printf("SHA_SCHED=%s\n", sha_sched_name());
     time_split_print(dt);
     time_split_off();
     printf("RESULT: PASS\n");
@@ -2365,6 +2444,7 @@ static int run_testnet(const char *host, int port, const char *user, const char 
     printf("hashes=%llu\n", (unsigned long long)hashes);
     printf("H/s=%.0f\n", hs);
     printf("threads=%d\n", threads);
+    printf("SHA_SCHED=%s\n", sha_sched_name());
     printf("shares_submitted=%llu\n", (unsigned long long)client.shares_submitted);
     printf("shares_accepted=%llu\n", (unsigned long long)client.shares_accepted);
     printf("shares_rejected=%llu\n", (unsigned long long)client.shares_rejected);
@@ -2397,6 +2477,8 @@ static void usage(const char *argv0) {
         "  %s --soak SEC          offline multi-thread hash for SEC seconds\n"
         "                         prints H/s every --report interval (default 2s)\n"
         "  %s --threads N         worker count (default: hw.physicalcpu)\n"
+        "  %s --sha-sched a|b     E6 hash schedule (default a). Offline mine only;\n"
+        "                         testnet scan stays on sha256_compress\n"
         "  %s --pin / --no-pin    macOS P-core QoS + affinity tags (default --pin)\n"
         "  %s --testnet           mine BTCLab testnet3 (suggest_diff=0.001)\n"
         "  %s --stratum HOST:PORT --user USER [--pass PASS] [--suggest-diff D]\n"
@@ -2408,7 +2490,7 @@ static void usage(const char *argv0) {
         "target check still uses mining.set_difficulty from the pool.\n"
         "\n"
         "Educational testnet only. No mainnet / AntPool.\n",
-        argv0, argv0, argv0, argv0, argv0, argv0, argv0);
+        argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 int main(int argc, char **argv) {
@@ -2468,6 +2550,16 @@ int main(int argc, char **argv) {
             soak_seconds = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--report") == 0 && i + 1 < argc) {
             report_s = strtod(argv[++i], NULL);
+        } else if (strcmp(argv[i], "--sha-sched") == 0 && i + 1 < argc) {
+            const char *s = argv[++i];
+            if (strcmp(s, "a") == 0 || strcmp(s, "A") == 0) {
+                g_sha_sched_b = 0;
+            } else if (strcmp(s, "b") == 0 || strcmp(s, "B") == 0) {
+                g_sha_sched_b = 1;
+            } else {
+                fprintf(stderr, "--sha-sched expects a or b\n");
+                return 2;
+            }
         } else if (strcmp(argv[i], "--pin") == 0) {
             g_pin_cores = 1;
         } else if (strcmp(argv[i], "--no-pin") == 0) {
@@ -2490,6 +2582,8 @@ int main(int argc, char **argv) {
     printf("silicon-miner educational harness\n");
     printf("=================================\n");
     printf("THREADS=%d (%s)\n", threads, thread_src);
+    printf("SHA_SCHED=%s (%s)\n", sha_sched_name(),
+           g_sha_sched_b ? "E6 lane-major" : "baseline paired lanes");
     report_pin_policy(threads);
 
     if (soak_mode && (have_stratum || testnet_mode)) {
@@ -2544,6 +2638,7 @@ int main(int argc, char **argv) {
     printf("TIMING: hit=%d  elapsed=%.6f s  threads=%d  H/s=%.0f\n", hit, dt, threads, hs);
     printf("H/s=%.0f\n", hs);
     printf("threads=%d\n", threads);
+    printf("SHA_SCHED=%s\n", sha_sched_name());
     time_split_print(dt);
     time_split_off();
 

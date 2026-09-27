@@ -2,9 +2,9 @@
 """Adapt Apple Mach-O asm syntax to GNU as ELF.
 
 Textual only: @PAGE/@PAGEOFF, the const section name, and the Mach-O
-leading underscore on the three exported hash-path symbols. Instructions
-are unchanged. The Mac build assembles sha256d_mine.s directly; this
-exists so a Linux VM can assemble and run that same hash path under
+leading underscore on the exported hash-path symbols. Instructions are
+unchanged. The Mac build assembles sha256d_mine.s directly; this exists
+so a Linux VM can assemble and run that same hash path under
 qemu-aarch64 (Apple Silicon H/s are not measured here).
 """
 import re
@@ -18,10 +18,13 @@ def main() -> None:
     src = src.replace(".section __TEXT,__const", ".section .rodata")
     src = re.sub(r"(\w+)@PAGEOFF", r":lo12:\1", src)
     src = re.sub(r"(\w+)@PAGE", r"\1", src)
+    # Longer names first so _sha256d_mine_midstate_e6b is not stripped
+    # down to the baseline symbol by the shorter replace.
     for name in (
-        "sha256_compress",
-        "sha256d_genesis_selftest",
+        "sha256d_mine_midstate_e6b",
         "sha256d_mine_midstate",
+        "sha256d_genesis_selftest",
+        "sha256_compress",
     ):
         src = src.replace("_" + name, name)
     open(sys.argv[2], "w", encoding="utf-8").write(src)

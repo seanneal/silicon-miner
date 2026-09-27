@@ -124,7 +124,7 @@ Landed on `main` (PR #1 squash merge `86fe9cf`, 2026-09-26). TIME_SPLIT accounti
 | E3 | Multi-thread `measure.sh` | eng | Done (MT peak watts TBD) |
 | E4 | Job midstate staging while hashing | eng | Done / soak saw `staged_overlap=1` |
 | E5 | Async share submit | eng | Done / soak exercised path |
-| E6 | `exp/sha-pipe-schedule` | **formal experiment fork** | Not started |
+| E6 | `exp/sha-pipe-schedule` | **formal experiment fork** | This branch (section 13). Not merged |
 | E7 | `exp/dual-job` | **formal experiment fork** | Not started |
 
 Protocol: E6 and E7 each get their own branch, measure, and decision. Do not stack them.
@@ -421,4 +421,109 @@ BATCHES started=4105 early_share=0 early_clean=2 full=4103 avg_flight_s=0.0291 h
 
 `./miner_test --threads 8 2000000` on this pull: **H/s=77561467** (~77.6 MH/s).
 
-Short offline batches move around. Section 11 already recorded 8T timed batches at **88094085** (~88.1 MH/s) and **90991811** (~91.0 MH/s) the same day. **77.6 MH/s** is another short sample, not a live regression. The 120 s Stratum soak is the comparison. E6 and E7 were not started.
+Short offline batches move around. Section 11 already recorded 8T timed batches at **88094085** (~88.1 MH/s) and **90991811** (~91.0 MH/s) the same day. **77.6 MH/s** is another short sample, not a live regression. The 120 s Stratum soak is the comparison. E6 starts in section 13. E7 is not in that experiment.
+
+---
+
+## 13. E6 — SHA-pipe schedule A/B (`exp/sha-pipe-schedule`)
+
+Formal experiment fork. Not ordinary engineering, and not for squash-merge until a Mac measurement decides. E7 is not in this change. qemu H/s is not an Apple Silicon number.
+
+### Hypothesis
+
+Firestorm (M1 P-core) has one SHA unit. Public timings (Dougall Johnson, firestorm-simd):
+
+| Instruction | Latency | Reciprocal throughput | Unit |
+|-------------|---------|------------------------|------|
+| `SHA256H` / `SHA256H2` | 4 cycles if the destination feeds the next op's first source; 5 cycles into source 2 or the message operand | 2 (one every two cycles) | u14 only |
+| `SHA256SU0` | 2 | 1 | u14 only |
+| `SHA256SU1` | 3 | 1 | u14 only |
+
+`SU0`/`SU1` cannot dual-issue beside `H`/`H2`. A scheduled dual-lane round-group is 4 hash ops × 2 cycles + 4 schedule ops × 1 cycle = 12 cycles of that pipe, and both arms issue exactly those ops. The pipe is already full. A large win is not available from reordering.
+
+What can still move is a 1-cycle bubble. Schedule A (main) issues both lanes together:
+
+```
+SU0_A, SU0_B, H_A, H_B, SU1_A, SU1_B, H2_A, H2_B
+```
+
+Lane A's `SHA256H2` starts only after both `H` ops and both `SU1` ops. The next round's `SHA256H` reads that `H2` result as source 2. If that forward is the 5-cycle path, `H2` issued late waits one cycle past the 12-cycle budget.
+
+Schedule B (this experiment) is lane-major. Each round-group finishes lane A before lane B:
+
+```
+SU0_A, H_A, SU1_A, H2_A, SU0_B, H_B, SU1_B, H2_B
+```
+
+Hash-only groups (no message schedule) are `H_A, H2_A, H_B, H2_B`. `H2` issues in the throughput slot right after that lane's `H`, so the q1 result is ready while the other lane still holds u14. Operands and instruction counts match schedule A. Only the issue order inside the dual-lane loop changes. The single-lane odd tail and `_sha256_compress` are the same in both arms.
+
+**Expected:** a small single-digit percent on the offline dual-lane hash path, or flat. Not a new throughput ceiling.
+
+### Method
+
+| Arm | Flag | Symbol |
+|-----|------|--------|
+| A, baseline (current main asm) | `--sha-sched a` (default) | `_sha256d_mine_midstate` |
+| B, lane-major | `--sha-sched b` | `_sha256d_mine_midstate_e6b` |
+
+C only selects the entry point. The hash path stays pure ARM64 asm. Offline timed batches, `--soak`, and `--metrics` use that entry. The testnet scan still hashes with `_sha256_compress` plus the C target check in both arms, because a share needs the digest and the mine loop only equality-compares. A live A/B is a check that the scan path did not move; it is not the SHA-pipe treatment. Startup prints `SHA_SCHED=A` or `SHA_SCHED=B`.
+
+Self-test (both arms, every run): genesis nonce `7c2bac1d` on lane A, lane B, the dual-loop back-edge, the odd tail, a miss, and the single-lane count of 1. Share-target checks and `TIME_SPLIT` counters are unchanged.
+
+Context the coordinator stated after Step 1 (#8) and Step 2 (#10), for comparison only: live default about **80.2 MH/s at 8 threads**, share wall about **9.5%**. Section 12's recorded 8T soak is **71.7 MH/s** on an earlier same-day run. This section does not replace that row.
+
+### qemu correctness (not H/s)
+
+Run on this branch under `qemu-aarch64-static -cpu max` (`make` / `./miner_test.aarch64 --threads 2`, and the same with `--sha-sched b`). qemu H/s is not recorded. Apple Silicon throughput is the tables below.
+
+| Check | Result |
+|-------|--------|
+| Genesis asm self-test (`SELFTEST: PASS`, nonce `7c2bac1d`) | **PASS** |
+| Schedule A and B dual-lane / single-lane genesis (`SELFTEST: E6 schedule A and B genesis OK (nonce=7c2bac1d)`) | **PASS** on both `--sha-sched a` and `--sha-sched b` |
+| Share-target self-test (342 cases) and threaded share scan | **PASS** |
+| `TIME_SPLIT` / `TIME_SPLIT_GAPS` counters armed | **PASS** |
+| `RESULT` | **PASS** |
+
+### Mac offline — PLACEHOLDER
+
+Short 2M-nonce batches are noisy (sections 11 and 12). Prefer the same command on both arms, back to back, machine awake. 1T is one thread. Default is `hw.physicalcpu` (8 on the 6P+2E MacBookPro18,3).
+
+```sh
+./miner_test --sha-sched a --threads 1 2000000
+./miner_test --sha-sched b --threads 1 2000000
+./miner_test --sha-sched a 2000000
+./miner_test --sha-sched b 2000000
+```
+
+| Arm | Threads | H/s | `SHA_SCHED` line | Notes |
+|-----|---------|-----|------------------|-------|
+| A | 1 | PLACEHOLDER | PLACEHOLDER | offline timed batch |
+| B | 1 | PLACEHOLDER | PLACEHOLDER | offline timed batch |
+| A | default | PLACEHOLDER | PLACEHOLDER | offline timed batch |
+| B | default | PLACEHOLDER | PLACEHOLDER | offline timed batch |
+| B vs A, 1T | | PLACEHOLDER % | | single-digit or flat expected |
+| B vs A, default | | PLACEHOLDER % | | single-digit or flat expected |
+
+### Mac live soak — PLACEHOLDER
+
+Same shape as section 12. The scan hash is `_sha256_compress` in both arms, so a live delta is not evidence for or against the lane-major mine loop. Record it so the arms are not mixed up with a code change on the scan path.
+
+```sh
+caffeinate -dims ./miner_test --sha-sched a --testnet --seconds 120 --max-shares 0 --suggest-diff 0.001
+caffeinate -dims ./miner_test --sha-sched b --testnet --seconds 120 --max-shares 0 --suggest-diff 0.001
+```
+
+| Field | Schedule A | Schedule B |
+|-------|------------|------------|
+| Machine | PLACEHOLDER | PLACEHOLDER |
+| `SHA_SCHED` | A | B |
+| Threads | PLACEHOLDER (default) | PLACEHOLDER (default) |
+| Live H/s | PLACEHOLDER | PLACEHOLDER |
+| Hashes | PLACEHOLDER | PLACEHOLDER |
+| Shares accepted / submitted | PLACEHOLDER | PLACEHOLDER |
+| `TIME_SPLIT_PCT` hash / share / other | PLACEHOLDER | PLACEHOLDER |
+| `TIME_SPLIT_GAPS_DETAIL` wake_s / join_s | PLACEHOLDER | PLACEHOLDER |
+| `BATCHES` early_share / hashes_per_flight | PLACEHOLDER | PLACEHOLDER |
+| B vs A live H/s | PLACEHOLDER % | |
+
+**Decision:** leave this PR open. Do not treat a flat result as a failed build. Merge only if the Mac offline hash path shows a repeatable gain worth keeping; otherwise close the experiment.

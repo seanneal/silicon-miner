@@ -158,7 +158,17 @@ Compare an offline `--soak` (dual-lane `_sha256d_mine_midstate`) with a testnet 
 |--------|------|
 | `_sha256_compress` | One 64-byte block; state in/out |
 | `_sha256d_genesis_selftest` | FIPS "abc" + genesis midstate mine; `0` = PASS |
-| `_sha256d_mine_midstate` | Dual-lane midstate loop. Next-group schedule sits under `SHA256H`/`H2`; cached midstate/IV are added in place |
+| `_sha256d_mine_midstate` | Dual-lane midstate loop, schedule A (paired lanes). Next-group schedule sits under `SHA256H`/`H2` |
+| `_sha256d_mine_midstate_e6b` | E6 schedule B (lane-major). Same signature. Selected with `--sha-sched b` |
+
+## E6 schedule A/B (`exp/sha-pipe-schedule`)
+
+Formal experiment, not an ordinary main change. Default `--sha-sched a` is the current paired-lane mine loop. `--sha-sched b` calls `_sha256d_mine_midstate_e6b`, which finishes lane A (`SHA256SU0`, `SHA256H`, `SHA256SU1`, `SHA256H2`) before lane B. The testnet per-nonce scan still uses `_sha256_compress` in both arms. Self-test checks genesis nonce `7c2bac1d` on both schedules. See STATS.md section 13. E7 is not in this tree.
+
+```sh
+./miner_test --sha-sched a --threads 1 2000000
+./miner_test --sha-sched b --threads 1 2000000
+```
 
 ## Constraints
 
