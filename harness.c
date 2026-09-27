@@ -7,6 +7,10 @@
  * slice with the existing asm compress (sha256d_asm_one). A live share is
  * queued and the slice finishes; it does not cancel siblings or roll
  * extranonce2. TIME_SPLIT (mono_clock.h) accounts wall time around those calls.
+ *
+ * E7 (--dual-job on) is a formal experiment: two midstate slots stay live and
+ * a worker whose slot runs dry claims the other one. Default --dual-job off
+ * is the single-job path. The asm hash path is not rewritten.
  */
 #include <stdio.h>
 #include <stdint.h>
@@ -89,6 +93,8 @@ static void on_sigint(int sig) { (void)sig; g_stop = 1; }
 
 /* Default on. --no-pin clears it. macOS only; Linux reports PIN=na. */
 static int g_pin_cores = 1;
+/* E7. Default off: one live job, same as main. --dual-job on keeps two. */
+static int g_dual_job = 0;
 /* Set by the testnet loop so a clean_jobs notify stops stale hashing.
  * Not checked on every nonce: a share-path load here was pure overhead.
  * 256 nonces is a few tens of microseconds at live rates. */
@@ -1351,6 +1357,12 @@ static double bench_commoncrypto_hs(const uint8_t header80[80], uint32_t batch) 
 }
 #endif
 
+static int dual_mine_span(const uint32_t mid[8], const uint32_t w_be[16],
+                          uint32_t nonce_start, uint32_t nonce_count,
+                          const uint32_t expect[8], uint32_t *found_nonce,
+                          int threads);
+static int selftest_dual_job(int threads);
+
 static void run_metrics(uint32_t batch, const uint32_t mid[8], const uint32_t w_be[16],
                         const uint8_t header80[80], int threads) {
     printf("\n=== METRICS (no-power harness) ===\n");
@@ -1365,7 +1377,9 @@ static void run_metrics(uint32_t batch, const uint32_t mid[8], const uint32_t w_
     printf("ASM_TIMING: hashing %u nonces on %d thread(s) (dual-lane mine, expect no hit)...\n",
            batch, threads);
     double t0 = monotonic_seconds();
-    int hit = mine_midstate_n(mid, w_be, 0u, batch, TARGET_NEVER, &found, threads);
+    int hit = g_dual_job
+        ? dual_mine_span(mid, w_be, 0u, batch, TARGET_NEVER, &found, threads)
+        : mine_midstate_n(mid, w_be, 0u, batch, TARGET_NEVER, &found, threads);
     double t1 = monotonic_seconds();
     double dt = t1 - t0;
     if (dt < 1e-9) dt = 1e-9;
@@ -1612,6 +1626,8 @@ static int run_selftest(int threads) {
     if (selftest_batch_wake(1) != 0)
         return 1;
     if (threads != 1 && selftest_batch_wake(threads) != 0)
+        return 1;
+    if (selftest_dual_job(threads) != 0)
         return 1;
     time_split_off();
     return 0;
@@ -2030,11 +2046,1002 @@ static int selftest_batch_wake(int threads) {
 }
 
 /*
+ * E7 dual-job feed.
+ * Two slots, each with its own midstate. Workers claim a slice and call the
+ * existing asm (mine: _sha256d_mine_midstate, testnet: sha256d_asm_one).
+ * When a slot cannot fill the workers, the next claim takes the other slot.
+ * No join between those claims. --dual-job off does not call this.
+ * Live shares match Step 1: queue the hit, finish the slice, do not roll
+ * extranonce2. The target compare is the same MSW check as the single-job scan.
+ */
+#define DJ_MINE_SLICE (1u << 20)
+#define DJ_SCAN_SLICE (1u << 16)
+
+typedef struct {
+    work_buf_t work;
+    const uint32_t *expect;
+    uint32_t cursor;
+    uint32_t left;
+    uint32_t claim_size; /* fixed at arm time so later claims do not dice the slot */
+    int underfed;        /* armed window had fewer nonces than workers */
+    int mine;
+    int live;
+    int inflight;
+    _Atomic int cancel;
+    int batch_open;
+} dj_slot_t;
+
+typedef struct dj_feed dj_feed_t;
+typedef struct dj_worker dj_worker_t;
+
+typedef struct {
+    int slot;
+    uint32_t nonce_start;
+    uint32_t nonce_count;
+    int mine;
+    uint32_t mid[8];
+    uint32_t w_be[16];
+    uint8_t target[32];
+    const uint32_t *expect;
+    char job_id[STRATUM_JOB_ID_MAX];
+    char ntime[16];
+    uint64_t en2;
+    _Atomic int *cancel;
+} dj_claim_t;
+
+struct dj_worker {
+    int index;
+    dj_feed_t *feed;
+    int prev_slot;
+    uint64_t hash_ticks;
+    uint64_t share_ticks;
+    uint64_t submit_ticks;
+    uint64_t idle_ns;
+    uint64_t t_start_ns;
+    uint64_t t_end_ns;
+};
+
+struct dj_feed {
+    dj_slot_t slot[2];
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int nthreads;
+    int refillable;
+    int stop;
+    int count_overlap;
+    int any_hit;
+    uint32_t found;
+    uint32_t best_off;
+    uint32_t origin;
+    _Atomic uint64_t hashes;
+    uint64_t switches;
+    uint64_t underfeed;
+    uint64_t install_while_live;
+    uint64_t idle_ns_total;
+    uint64_t last_staged_seq;
+    int idle;
+    work_buf_t pending;
+    int have_pending;
+    int pending_hot;
+    uint32_t pending_count;
+};
+
+static void poll_accounted(stratum_client_t *c, int timeout_ms, int wake_fd);
+
+static void dj_feed_init(dj_feed_t *f, int threads, int refillable) {
+    memset(f, 0, sizeof *f);
+    pthread_mutex_init(&f->mu, NULL);
+    pthread_cond_init(&f->cv, NULL);
+    f->nthreads = clamp_threads(threads);
+    f->refillable = refillable;
+    f->origin = 0;
+}
+
+static void dj_feed_destroy(dj_feed_t *f) {
+    pthread_cond_destroy(&f->cv);
+    pthread_mutex_destroy(&f->mu);
+}
+
+static int dj_slot_free_locked(const dj_slot_t *s) {
+    return s->inflight == 0 && s->left == 0;
+}
+
+static void dj_close_batch_locked(dj_slot_t *s) {
+    if (!s->batch_open) return;
+    int was = atomic_load_explicit(&s->cancel, memory_order_relaxed);
+    /* A share that finishes the window is a full batch (Step 1). */
+    batch_count_end(0, was);
+    s->batch_open = 0;
+}
+
+static uint32_t dj_claim_size(uint32_t count, int nthreads, int mine) {
+    if (count == 0) return 0;
+    if (nthreads < 1) nthreads = 1;
+    uint32_t cap = mine ? DJ_MINE_SLICE : DJ_SCAN_SLICE;
+    uint32_t piece = count / (uint32_t)nthreads;
+    if (piece < 1) piece = count;
+    if (piece > cap) piece = cap;
+    if (mine && piece >= 2) piece &= ~1u;
+    if (piece < 1) piece = count < cap ? count : cap;
+    if (piece > count) piece = count;
+    return piece;
+}
+
+static void dj_arm_window_locked(dj_feed_t *f, dj_slot_t *s, uint32_t count, int mine) {
+    s->claim_size = dj_claim_size(count, f->nthreads, mine);
+    s->underfed = f->nthreads > 0 && count > 0 && count < (uint32_t)f->nthreads;
+    s->mine = mine;
+    s->left = count;
+    s->live = count > 0;
+}
+
+static void dj_arm_slot_locked(dj_feed_t *f, int idx,
+                               const uint32_t mid[8], const uint32_t w_be[16],
+                               const uint8_t *target, const uint32_t *expect,
+                               uint32_t start, uint32_t count, int mine) {
+    dj_slot_t *s = &f->slot[idx];
+    dj_close_batch_locked(s);
+    memset(&s->work, 0, sizeof s->work);
+    if (mid) memcpy(s->work.mid, mid, sizeof s->work.mid);
+    if (w_be) memcpy(s->work.w_be, w_be, sizeof s->work.w_be);
+    if (target) memcpy(s->work.target, target, sizeof s->work.target);
+    s->expect = expect;
+    s->cursor = start;
+    s->work.ready = count > 0;
+    atomic_store_explicit(&s->cancel, 0, memory_order_relaxed);
+    dj_arm_window_locked(f, s, count, mine);
+    if (count > 0) {
+        batch_count_begin();
+        s->batch_open = 1;
+    }
+}
+
+static void dj_note_install_locked(dj_feed_t *f, uint64_t seq, int other_hot,
+                                   uint64_t *staged) {
+    if (!f->count_overlap || !other_hot) return;
+    f->install_while_live++;
+    if (staged && seq != f->last_staged_seq) {
+        (*staged)++;
+        f->last_staged_seq = seq;
+    }
+}
+
+static void dj_install_work_locked(dj_feed_t *f, int idx, const work_buf_t *w,
+                                   uint32_t count, int mine) {
+    dj_slot_t *s = &f->slot[idx];
+    dj_close_batch_locked(s);
+    s->work = *w;
+    s->expect = NULL;
+    s->cursor = w->nonce_cursor;
+    atomic_store_explicit(&s->cancel, 0, memory_order_relaxed);
+    dj_arm_window_locked(f, s, count, mine);
+    if (count > 0) {
+        batch_count_begin();
+        s->batch_open = 1;
+    }
+}
+
+static void dj_cancel_slot_locked(dj_slot_t *s) {
+    atomic_store_explicit(&s->cancel, 1, memory_order_relaxed);
+    s->live = 0;
+    s->left = 0;
+}
+
+static int dj_try_claim_locked(dj_feed_t *f, dj_worker_t *w, dj_claim_t *c) {
+    int best = -1;
+    uint32_t best_left = 0;
+    for (int i = 0; i < 2; i++) {
+        dj_slot_t *s = &f->slot[i];
+        if (!s->live || s->left == 0) continue;
+        if (atomic_load_explicit(&s->cancel, memory_order_relaxed)) continue;
+        if (s->left > best_left) {
+            best = i;
+            best_left = s->left;
+        }
+    }
+    if (best < 0) return 0;
+    dj_slot_t *s = &f->slot[best];
+    uint32_t left = s->left;
+    uint32_t take = s->claim_size ? s->claim_size : left;
+    if (take > left) take = left;
+    if (take < 1) take = left;
+    if (s->underfed) {
+        f->underfeed++;
+        s->underfed = 0;
+    }
+    if (w->prev_slot >= 0 && w->prev_slot != best)
+        f->switches++;
+    w->prev_slot = best;
+
+    memset(c, 0, sizeof *c);
+    c->slot = best;
+    c->nonce_start = s->cursor;
+    c->nonce_count = take;
+    c->mine = s->mine;
+    memcpy(c->mid, s->work.mid, sizeof c->mid);
+    memcpy(c->w_be, s->work.w_be, sizeof c->w_be);
+    memcpy(c->target, s->work.target, sizeof c->target);
+    c->expect = s->expect;
+    memcpy(c->job_id, s->work.job_id, sizeof c->job_id);
+    memcpy(c->ntime, s->work.ntime, sizeof c->ntime);
+    c->en2 = s->work.en2;
+    c->cancel = &s->cancel;
+    s->cursor += take;
+    s->left -= take;
+    if (s->left == 0) s->live = 0;
+    s->inflight++;
+    return 1;
+}
+
+static void dj_record_hit_locked(dj_feed_t *f, uint32_t nonce) {
+    uint32_t off = nonce - f->origin;
+    if (earlier_hit(f->any_hit, f->best_off, f->origin, nonce)) {
+        f->any_hit = 1;
+        f->found = nonce;
+        f->best_off = off;
+    }
+}
+
+static void dj_hash_mine(dj_worker_t *w, const dj_claim_t *c, int timing) {
+    uint32_t found = 0;
+    const uint32_t *expect = c->expect ? c->expect : TARGET_NEVER;
+    uint64_t a = timing ? mono_ticks() : 0;
+    int hit = sha256d_mine_midstate(c->mid, c->w_be, c->nonce_start, c->nonce_count,
+                                    expect, &found);
+    if (timing) w->hash_ticks += mono_ticks() - a;
+    atomic_fetch_add_explicit(&w->feed->hashes, c->nonce_count, memory_order_relaxed);
+    if (!hit) return;
+    pthread_mutex_lock(&w->feed->mu);
+    dj_record_hit_locked(w->feed, found);
+    pthread_mutex_unlock(&w->feed->mu);
+}
+
+static void dj_hash_scan(dj_worker_t *w, const dj_claim_t *c, int timing, uint64_t ov) {
+    uint32_t dig[8];
+    uint32_t msw[8];
+    uint64_t t_enter = timing ? mono_ticks() : 0;
+    uint64_t hash_raw = 0;
+    uint64_t submit_ticks = 0;
+    uint32_t timed_n = 0;
+    uint32_t hashed = 0;
+    int hit = 0;
+    uint32_t found = 0;
+    int job_ok = c->job_id[0] != '\0';
+    /* Once per slice, same as the single-job scan. */
+    stratum_target_msw(c->target, msw);
+
+    for (uint32_t i = 0; i < c->nonce_count; i++) {
+        if ((i & (SCAN_CANCEL_EVERY - 1u)) == 0 &&
+            (g_stop ||
+             atomic_load_explicit(&g_scan_cancel, memory_order_relaxed) ||
+             (c->cancel &&
+              atomic_load_explicit(c->cancel, memory_order_relaxed))))
+            break;
+        uint32_t nonce = c->nonce_start + i;
+        if (timing) {
+            uint64_t a = mono_ticks();
+            sha256d_asm_one(c->mid, c->w_be, nonce, dig);
+            hash_raw += mono_ticks() - a;
+            timed_n++;
+        } else {
+            sha256d_asm_one(c->mid, c->w_be, nonce, dig);
+        }
+        hashed++;
+        if (__builtin_expect(stratum_hash_meets_target_msw(dig, msw), 0)) {
+            if (!hit) {
+                hit = 1;
+                found = nonce;
+                if (job_ok)
+                    printf("SHARE_CANDIDATE nonce=0x%08x en2=%llu job=%s\n",
+                           nonce, (unsigned long long)c->en2, c->job_id);
+            }
+            if (job_ok) {
+                if (timing) {
+                    uint64_t d0 = mono_ticks();
+                    (void)share_q_push(c->job_id, c->ntime, c->en2, nonce);
+                    submit_ticks += mono_ticks() - d0;
+                } else {
+                    (void)share_q_push(c->job_id, c->ntime, c->en2, nonce);
+                }
+            }
+            /* Finish the slice. A share does not roll extranonce2. */
+        }
+    }
+
+    atomic_fetch_add_explicit(&w->feed->hashes, hashed, memory_order_relaxed);
+    if (timing) {
+        uint64_t total = mono_ticks() - t_enter;
+        uint64_t pull = (uint64_t)timed_n * ov;
+        w->hash_ticks += hash_raw > pull ? hash_raw - pull : 0;
+        w->submit_ticks += submit_ticks;
+        uint64_t used = hash_raw + submit_ticks + pull;
+        w->share_ticks += total > used ? total - used : 0;
+    }
+    if (!hit) return;
+    pthread_mutex_lock(&w->feed->mu);
+    dj_record_hit_locked(w->feed, found);
+    pthread_mutex_unlock(&w->feed->mu);
+}
+
+static void *dj_worker(void *arg) {
+    dj_worker_t *w = (dj_worker_t *)arg;
+    dj_feed_t *f = w->feed;
+    worker_qos_hint(w->index);
+    (void)mono_ns();
+    int timing = time_split_on();
+    uint64_t ov = timing ? tick_overhead() : 0;
+
+    for (;;) {
+        dj_claim_t claim;
+        int got = 0;
+        pthread_mutex_lock(&f->mu);
+        int idling = 0;
+        uint64_t idle_t0 = 0;
+        for (;;) {
+            if (dj_try_claim_locked(f, w, &claim)) {
+                got = 1;
+                break;
+            }
+            if (f->stop || !f->refillable) break;
+            if (!idling) {
+                idling = 1;
+                f->idle++;
+                if (f->idle == f->nthreads)
+                    batch_wake_signal();
+                if (timing) idle_t0 = mono_ns();
+            }
+            pthread_cond_wait(&f->cv, &f->mu);
+        }
+        if (idling) {
+            f->idle--;
+            if (timing && idle_t0) {
+                uint64_t t1 = mono_ns();
+                if (t1 > idle_t0) w->idle_ns += t1 - idle_t0;
+            }
+        }
+        pthread_mutex_unlock(&f->mu);
+        if (!got) break;
+
+        if (timing && w->t_start_ns == 0)
+            w->t_start_ns = mono_ns();
+        if (claim.mine)
+            dj_hash_mine(w, &claim, timing);
+        else
+            dj_hash_scan(w, &claim, timing, ov);
+        if (timing)
+            w->t_end_ns = mono_ns();
+
+        pthread_mutex_lock(&f->mu);
+        dj_slot_t *s = &f->slot[claim.slot];
+        if (s->inflight > 0) s->inflight--;
+        if (s->inflight == 0 && s->left == 0) {
+            dj_close_batch_locked(s);
+            batch_wake_signal();
+            pthread_cond_broadcast(&f->cv);
+        }
+        pthread_mutex_unlock(&f->mu);
+    }
+    return NULL;
+}
+
+static int dj_start(dj_feed_t *f, dj_worker_t *ws, pthread_t *tids) {
+    for (int i = 0; i < f->nthreads; i++) {
+        memset(&ws[i], 0, sizeof ws[i]);
+        ws[i].index = i;
+        ws[i].feed = f;
+        ws[i].prev_slot = -1;
+        if (pthread_create(&tids[i], NULL, dj_worker, &ws[i]) != 0) {
+            fprintf(stderr, "NOTE: pthread_create failed at dual-job worker %d\n", i);
+            pthread_mutex_lock(&f->mu);
+            f->stop = 1;
+            pthread_cond_broadcast(&f->cv);
+            pthread_mutex_unlock(&f->mu);
+            for (int j = 0; j < i; j++) pthread_join(tids[j], NULL);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void dj_join(dj_feed_t *f, pthread_t *tids) {
+    pthread_mutex_lock(&f->mu);
+    f->stop = 1;
+    for (int i = 0; i < 2; i++)
+        dj_cancel_slot_locked(&f->slot[i]);
+    pthread_cond_broadcast(&f->cv);
+    pthread_mutex_unlock(&f->mu);
+    for (int i = 0; i < f->nthreads; i++)
+        pthread_join(tids[i], NULL);
+}
+
+static void dj_account(dj_feed_t *f, dj_worker_t *ws, uint64_t t_decide, int scan) {
+    uint64_t lo = UINT64_MAX;
+    uint64_t hi = 0;
+    int any = 0;
+    uint64_t idle = 0;
+    for (int i = 0; i < f->nthreads; i++) {
+        idle += ws[i].idle_ns;
+        if (!ws[i].t_start_ns) continue;
+        any = 1;
+        if (ws[i].t_start_ns < lo) lo = ws[i].t_start_ns;
+        if (ws[i].t_end_ns > hi) hi = ws[i].t_end_ns;
+        g_cpu_hash_ticks += ws[i].hash_ticks;
+        g_cpu_share_ticks += ws[i].share_ticks;
+        g_cpu_submit_ticks += ws[i].submit_ticks;
+        if (scan) g_scan_slices_timed++;
+    }
+    uint64_t span = (any && hi > lo) ? hi - lo : 0;
+    uint64_t idle_avg = f->nthreads ? idle / (uint64_t)f->nthreads : 0;
+    if (idle_avg > span) idle_avg = span;
+    if (any && hi > lo) {
+        add_flight_wall(lo, hi);
+        if (g_flight_wall_ns >= idle_avg)
+            g_flight_wall_ns -= idle_avg;
+    }
+    uint64_t t_after = time_split_on() ? mono_ns() : 0;
+    gap_add_batch_edges(t_decide, t_after, any ? lo : UINT64_MAX, any ? hi : 0, 0, 0);
+    if (time_split_on())
+        g_flight_hashes += atomic_load_explicit(&f->hashes, memory_order_relaxed);
+    for (int i = 0; i < 2; i++) {
+        dj_slot_t *s = &f->slot[i];
+        if (!s->batch_open) continue;
+        int was = atomic_load_explicit(&s->cancel, memory_order_relaxed);
+        int shortb = s->left > 0;
+        batch_count_end(0, was || shortb);
+        s->batch_open = 0;
+    }
+    f->idle_ns_total = idle;
+}
+
+static void dj_print_stats(const dj_feed_t *f) {
+    double idle_s = 0.0;
+    if (f->nthreads > 0)
+        idle_s = (double)f->idle_ns_total / (double)f->nthreads / 1e9;
+    printf("DUAL_JOB mode=on slots=2 switches=%llu underfeed=%llu "
+           "install_while_live=%llu idle_s=%.4f\n",
+           (unsigned long long)f->switches,
+           (unsigned long long)f->underfeed,
+           (unsigned long long)f->install_while_live,
+           idle_s);
+}
+
+static int dual_run_pair(int mine,
+                         const uint32_t mid0[8], const uint32_t w0[16],
+                         const uint8_t *t0, uint32_t s0, uint32_t n0,
+                         const uint32_t mid1[8], const uint32_t w1[16],
+                         const uint8_t *t1, uint32_t s1, uint32_t n1,
+                         const uint32_t *expect, int threads,
+                         uint32_t *found, uint64_t *hashes_out,
+                         uint64_t *switches_out, int print_stats) {
+    threads = clamp_threads(threads);
+    uint64_t t_decide = time_split_on() ? mono_ns() : 0;
+    dj_feed_t feed;
+    dj_feed_init(&feed, threads, 0);
+    pthread_mutex_lock(&feed.mu);
+    dj_arm_slot_locked(&feed, 0, mid0, w0, t0, expect, s0, n0, mine);
+    dj_arm_slot_locked(&feed, 1, mid1, w1, t1, expect, s1, n1, mine);
+    pthread_mutex_unlock(&feed.mu);
+
+    dj_worker_t ws[MAX_MINE_THREADS];
+    pthread_t tids[MAX_MINE_THREADS];
+    if (dj_start(&feed, ws, tids) != 0) {
+        dj_feed_destroy(&feed);
+        return -1;
+    }
+    for (int i = 0; i < feed.nthreads; i++)
+        pthread_join(tids[i], NULL);
+    dj_account(&feed, &ws[0], t_decide, mine ? 0 : 1);
+    if (found) *found = feed.found;
+    if (hashes_out)
+        *hashes_out = atomic_load_explicit(&feed.hashes, memory_order_relaxed);
+    if (switches_out) *switches_out = feed.switches;
+    int hit = feed.any_hit;
+    if (print_stats) dj_print_stats(&feed);
+    dj_feed_destroy(&feed);
+    return hit;
+}
+
+static int dual_mine_span(const uint32_t mid[8], const uint32_t w_be[16],
+                          uint32_t nonce_start, uint32_t nonce_count,
+                          const uint32_t expect[8], uint32_t *found_nonce,
+                          int threads) {
+    if (nonce_count == 0) return 0;
+    uint32_t n1 = nonce_count / 2u;
+    uint32_t n0 = nonce_count - n1;
+    return dual_run_pair(1,
+                         mid, w_be, NULL, nonce_start, n0,
+                         mid, w_be, NULL, nonce_start + n0, n1,
+                         expect, threads, found_nonce, NULL, NULL, 1);
+}
+
+static int selftest_dual_job(int threads) {
+    uint32_t mid[8], w_be[16], found = 0;
+    compute_midstate(mid, GENESIS_HEADER);
+    build_block1_wbe(w_be, GENESIS_HEADER);
+    uint32_t start = 0x7c2bac1du - 3u;
+
+    int hit = dual_run_pair(1, mid, w_be, NULL, start, 4,
+                            mid, w_be, NULL, start + 4, 4,
+                            GENESIS_DIGEST, threads, &found, NULL, NULL, 0);
+    if (hit != 1 || found != 0x7c2bac1du) {
+        printf("SELFTEST: FAIL (dual-job slot0 genesis hit=%d found=%08x)\n",
+               hit, found);
+        return 1;
+    }
+
+    found = 0;
+    hit = dual_run_pair(1, mid, w_be, NULL, start + 4, 4,
+                        mid, w_be, NULL, start, 4,
+                        GENESIS_DIGEST, threads, &found, NULL, NULL, 0);
+    if (hit != 1 || found != 0x7c2bac1du) {
+        printf("SELFTEST: FAIL (dual-job slot1 genesis hit=%d found=%08x)\n",
+               hit, found);
+        return 1;
+    }
+
+    uint8_t hdr2[80];
+    memcpy(hdr2, GENESIS_HEADER, 80);
+    hdr2[0] ^= 0xff;
+    uint32_t mid2[8], w2[16];
+    compute_midstate(mid2, hdr2);
+    build_block1_wbe(w2, hdr2);
+
+    /* Wrong midstate owns the genesis nonce. Real midstate owns a range that
+     * does not. A swapped feed would hit; the real feed must miss. */
+    found = 0;
+    hit = dual_run_pair(1, mid2, w2, NULL, start, 4,
+                        mid, w_be, NULL, 0, 4,
+                        GENESIS_DIGEST, threads, &found, NULL, NULL, 0);
+    if (hit != 0) {
+        printf("SELFTEST: FAIL (dual-job swapped midstate hit=%d found=%08x)\n",
+               hit, found);
+        return 1;
+    }
+
+    found = 0;
+    hit = dual_run_pair(1, mid2, w2, NULL, 0, 4,
+                        mid, w_be, NULL, start, 4,
+                        GENESIS_DIGEST, threads, &found, NULL, NULL, 0);
+    if (hit != 1 || found != 0x7c2bac1du) {
+        printf("SELFTEST: FAIL (dual-job real midstate slot hit=%d found=%08x)\n",
+               hit, found);
+        return 1;
+    }
+
+    uint64_t switches = 0;
+    found = 0;
+    hit = dual_run_pair(1, mid, w_be, NULL, 0, 4,
+                        mid, w_be, NULL, start, 4,
+                        GENESIS_DIGEST, 1, &found, NULL, &switches, 0);
+    if (hit != 1 || found != 0x7c2bac1du || switches < 1) {
+        printf("SELFTEST: FAIL (dual-job switch hit=%d found=%08x switches=%llu)\n",
+               hit, found, (unsigned long long)switches);
+        return 1;
+    }
+
+    found = 0;
+    uint64_t hashes = 0;
+    hit = dual_run_pair(1, mid, w_be, NULL, 0, 32,
+                        mid, w_be, NULL, 32, 32,
+                        TARGET_NEVER, threads, &found, &hashes, NULL, 0);
+    if (hit != 0 || hashes != 64) {
+        printf("SELFTEST: FAIL (dual-job never-target hit=%d hashes=%llu)\n",
+               hit, (unsigned long long)hashes);
+        return 1;
+    }
+
+    uint8_t target_zero[32];
+    memset(target_zero, 0, sizeof target_zero);
+    uint32_t dig[8];
+    sha256d_asm_one(mid, w_be, 0x7c2bac1du, dig);
+    uint8_t hash[32], target_exact[32];
+    for (int i = 0; i < 8; i++)
+        store_be32(hash + i * 4, dig[i]);
+    for (int i = 0; i < 32; i++)
+        target_exact[31 - i] = hash[i];
+
+    found = 0;
+    hashes = 0;
+    hit = dual_run_pair(0, mid, w_be, target_zero, 0, 16,
+                        mid, w_be, target_exact, start, 4,
+                        NULL, threads, &found, &hashes, NULL, 0);
+    if (hit != 1 || found != 0x7c2bac1du) {
+        printf("SELFTEST: FAIL (dual-job scan hit=%d found=%08x hashes=%llu)\n",
+               hit, found, (unsigned long long)hashes);
+        return 1;
+    }
+
+    found = 0;
+    hashes = 0;
+    hit = dual_run_pair(0, mid, w_be, target_zero, 0, 16,
+                        mid, w_be, target_zero, 16, 16,
+                        NULL, threads, &found, &hashes, NULL, 0);
+    if (hit != 0 || hashes != 32) {
+        printf("SELFTEST: FAIL (dual-job scan miss hit=%d hashes=%llu)\n",
+               hit, (unsigned long long)hashes);
+        return 1;
+    }
+
+    printf("SELFTEST: dual-job feed OK (threads=%d nonce=%08x)\n",
+           threads, 0x7c2bac1du);
+    return 0;
+}
+
+static int run_soak_dual(const uint32_t mid[8], const uint32_t w_be[16],
+                         int seconds, int threads, double report_s) {
+    if (seconds < 1) seconds = 1;
+    if (report_s < 0.2) report_s = 0.2;
+    const uint32_t chunk = 1u << 20;
+    printf("\n=== SOAK (offline, no pool) ===\n");
+    printf("SOAK_SECONDS=%d THREADS=%d REPORT_S=%.2f CHUNK=%u\n",
+           seconds, threads, report_s, chunk);
+    printf("DUAL_JOB=on\n");
+    signal(SIGINT, on_sigint);
+    signal(SIGTERM, on_sigint);
+
+    time_split_reset();
+    dj_feed_t feed;
+    dj_feed_init(&feed, threads, 1);
+    uint32_t next = 0;
+    uint64_t t_decide = mono_ns();
+    pthread_mutex_lock(&feed.mu);
+    dj_arm_slot_locked(&feed, 0, mid, w_be, NULL, TARGET_NEVER, next, chunk, 1);
+    next += chunk;
+    dj_arm_slot_locked(&feed, 1, mid, w_be, NULL, TARGET_NEVER, next, chunk, 1);
+    next += chunk;
+    pthread_mutex_unlock(&feed.mu);
+
+    dj_worker_t ws[MAX_MINE_THREADS];
+    pthread_t tids[MAX_MINE_THREADS];
+    if (dj_start(&feed, ws, tids) != 0) {
+        printf("RESULT: FAIL (dual-job soak threads)\n");
+        dj_feed_destroy(&feed);
+        time_split_off();
+        return 1;
+    }
+
+    double t0 = monotonic_seconds();
+    double t_mark = t0;
+    uint64_t hashes_mark = 0;
+    while (!g_stop) {
+        double now = monotonic_seconds();
+        if ((now - t0) >= (double)seconds) break;
+        pthread_mutex_lock(&feed.mu);
+        for (int i = 0; i < 2 && !feed.stop; i++) {
+            if (feed.slot[i].inflight == 0 && feed.slot[i].left == 0) {
+                dj_arm_slot_locked(&feed, i, mid, w_be, NULL, TARGET_NEVER,
+                                   next, chunk, 1);
+                next += chunk;
+                pthread_cond_broadcast(&feed.cv);
+            }
+        }
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 100000000L;
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec += 1;
+            ts.tv_nsec -= 1000000000L;
+        }
+        pthread_cond_timedwait(&feed.cv, &feed.mu, &ts);
+        pthread_mutex_unlock(&feed.mu);
+
+        now = monotonic_seconds();
+        if ((now - t_mark) >= report_s) {
+            double idt = now - t_mark;
+            double adt = now - t0;
+            if (idt < 1e-9) idt = 1e-9;
+            if (adt < 1e-9) adt = 1e-9;
+            uint64_t hashes = atomic_load_explicit(&feed.hashes, memory_order_relaxed);
+            uint64_t st0 = 0;
+            int st_on = 0;
+            status_account_begin(&st0, &st_on);
+            printf("SOAK t=%.1f hashes=%llu H/s=%.0f H/s_avg=%.0f threads=%d\n",
+                   adt, (unsigned long long)hashes,
+                   (double)(hashes - hashes_mark) / idt,
+                   (double)hashes / adt, threads);
+            fflush(stdout);
+            status_account_end(st0, st_on);
+            t_mark = now;
+            hashes_mark = hashes;
+        }
+    }
+
+    dj_join(&feed, tids);
+    dj_account(&feed, ws, t_decide, 0);
+    double dt = monotonic_seconds() - t0;
+    if (dt < 1e-9) dt = 1e-9;
+    uint64_t hashes = atomic_load_explicit(&feed.hashes, memory_order_relaxed);
+    double hs = (double)hashes / dt;
+    printf("SOAK_HASHES=%llu\n", (unsigned long long)hashes);
+    printf("SOAK_ELAPSED_S=%.3f\n", dt);
+    printf("SOAK_AVG_H/s=%.0f\n", hs);
+    printf("H/s=%.0f\n", hs);
+    printf("threads=%d\n", threads);
+    dj_print_stats(&feed);
+    time_split_print(dt);
+    time_split_off();
+    dj_feed_destroy(&feed);
+    printf("RESULT: PASS\n");
+    return 0;
+}
+
+/* Install a new header, or extend a drained slot, while the other stays live. */
+static int dj_maintain_testnet(dj_feed_t *f, stratum_client_t *c,
+                               uint64_t *en2_alloc, uint32_t scan_batch,
+                               uint64_t want_seq, int want_clean,
+                               uint64_t *staged) {
+    for (int guard = 0; guard < 4; guard++) {
+        int idx = -1;
+        int need_build = 0;
+        int hot = 0;
+        pthread_mutex_lock(&f->mu);
+        for (int i = 0; i < 2; i++) {
+            if (f->slot[i].live || f->slot[i].inflight > 0)
+                hot = 1;
+        }
+        if (want_clean) {
+            for (int i = 0; i < 2; i++) {
+                dj_slot_t *s = &f->slot[i];
+                if (s->work.ready && s->work.seq != want_seq)
+                    dj_cancel_slot_locked(s);
+            }
+        }
+        if (f->have_pending) {
+            for (int i = 0; i < 2; i++) {
+                if (!dj_slot_free_locked(&f->slot[i])) continue;
+                int other = i ^ 1;
+                int other_hot = f->slot[other].live || f->slot[other].inflight > 0;
+                int show_hot = other_hot || f->pending_hot;
+                char job_id[STRATUM_JOB_ID_MAX];
+                uint64_t en2_print;
+                uint64_t seq_print;
+                snprintf(job_id, sizeof job_id, "%s", f->pending.job_id);
+                en2_print = f->pending.en2;
+                seq_print = f->pending.seq;
+                dj_install_work_locked(f, i, &f->pending, f->pending_count, 0);
+                dj_note_install_locked(f, seq_print, show_hot, staged);
+                f->have_pending = 0;
+                pthread_cond_broadcast(&f->cv);
+                pthread_mutex_unlock(&f->mu);
+                printf("STRATUM: dual-job slot=%d job=%s en2=%llu seq=%llu other_hot=%d\n",
+                       i, job_id, (unsigned long long)en2_print,
+                       (unsigned long long)seq_print, show_hot);
+                fflush(stdout);
+                pthread_mutex_lock(&f->mu);
+                break;
+            }
+        }
+        if (!f->have_pending) {
+            for (int i = 0; i < 2; i++) {
+                dj_slot_t *s = &f->slot[i];
+                if (!dj_slot_free_locked(s)) continue;
+                int cancelled = atomic_load_explicit(&s->cancel, memory_order_relaxed);
+                int wrap = s->work.ready && s->cursor > (0xffffffffu - scan_batch);
+                int stale = !s->work.ready || s->work.seq != want_seq ||
+                            cancelled || wrap;
+                if (!stale) {
+                    atomic_store_explicit(&s->cancel, 0, memory_order_relaxed);
+                    dj_arm_window_locked(f, s, scan_batch, s->mine);
+                    if (!s->batch_open) {
+                        batch_count_begin();
+                        s->batch_open = 1;
+                    }
+                    pthread_cond_broadcast(&f->cv);
+                    continue;
+                }
+                idx = i;
+                need_build = 1;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&f->mu);
+        if (!need_build) return 0;
+
+        work_buf_t built;
+        uint64_t en2 = *en2_alloc;
+        if (prepare_work(c, &built, en2) != 0) {
+            fprintf(stderr, "STRATUM: dual-job prepare_work failed\n");
+            return -1;
+        }
+        (*en2_alloc)++;
+        pthread_mutex_lock(&f->mu);
+        if (dj_slot_free_locked(&f->slot[idx])) {
+            int other = idx ^ 1;
+            int other_hot = f->slot[other].live || f->slot[other].inflight > 0;
+            dj_install_work_locked(f, idx, &built, scan_batch, 0);
+            dj_note_install_locked(f, built.seq, other_hot || hot, staged);
+            pthread_cond_broadcast(&f->cv);
+            pthread_mutex_unlock(&f->mu);
+            printf("STRATUM: dual-job slot=%d job=%s en2=%llu seq=%llu other_hot=%d\n",
+                   idx, built.job_id, (unsigned long long)built.en2,
+                   (unsigned long long)built.seq, other_hot || hot);
+            fflush(stdout);
+        } else {
+            f->pending = built;
+            f->pending_count = scan_batch;
+            f->pending_hot = hot;
+            f->have_pending = 1;
+            pthread_mutex_unlock(&f->mu);
+        }
+    }
+    return 0;
+}
+
+static int run_testnet_dual(const char *host, int port, const char *user, const char *pass,
+                            double suggest_diff, int seconds, int max_shares, int threads) {
+    printf("\n=== TESTNET STRATUM ===\n");
+    printf("endpoint=%s:%d user=%s suggest_diff=%.8g duration=%ds threads=%d\n",
+           host, port, user, suggest_diff, seconds, threads);
+    printf("DUAL_JOB=on\n");
+
+    stratum_client_t client;
+    if (stratum_connect(&client, host, port, user, pass, suggest_diff) != 0) {
+        printf("RESULT: FAIL (stratum connect/auth)\n");
+        return 1;
+    }
+    if (!client.have_job) {
+        printf("STRATUM: waiting for first job...\n");
+        for (int i = 0; i < 100 && !client.have_job && !g_stop; i++)
+            stratum_poll(&client, 100);
+    }
+    if (!client.have_job) {
+        printf("RESULT: FAIL (no job received)\n");
+        stratum_close(&client);
+        return 1;
+    }
+    printf("STRATUM: difficulty=%.8g\n", client.difficulty);
+    if (max_shares == 0 && suggest_diff > 0.0 && suggest_diff < 1.0) {
+        printf("NOTE: suggest_diff %.8g with --max-shares 0 can flood submits "
+               "before vardiff rises. For an H/s soak pass --suggest-diff 1. "
+               "The share target is still the pool difficulty.\n",
+               suggest_diff);
+    }
+    if (batch_wake_open() != 0)
+        fprintf(stderr, "NOTE: batch wake pipe unavailable; in-flight poll keeps its timeout\n");
+
+    uint32_t scan_batch = 2u << 20;
+    printf("STRATUM: scan_batch=%u threads=%d dual_slots=2 scan_slice=%u\n",
+           scan_batch, threads, DJ_SCAN_SLICE);
+
+    g_share_head = 0;
+    g_share_tail = 0;
+    time_split_reset();
+
+    dj_feed_t feed;
+    dj_feed_init(&feed, threads, 1);
+    uint64_t en2_alloc = 0;
+    uint64_t staged = 0;
+    uint64_t want_seq = client.job.seq;
+    uint64_t t_decide = mono_ns();
+    if (dj_maintain_testnet(&feed, &client, &en2_alloc, scan_batch,
+                            want_seq, 0, NULL) != 0) {
+        printf("RESULT: FAIL (dual-job header)\n");
+        dj_feed_destroy(&feed);
+        stratum_close(&client);
+        time_split_off();
+        return 1;
+    }
+
+    dj_worker_t ws[MAX_MINE_THREADS];
+    pthread_t tids[MAX_MINE_THREADS];
+    if (dj_start(&feed, ws, tids) != 0) {
+        printf("RESULT: FAIL (dual-job threads)\n");
+        dj_feed_destroy(&feed);
+        stratum_close(&client);
+        time_split_off();
+        return 1;
+    }
+    feed.count_overlap = 1;
+    g_in_flight = 1;
+
+    double t0 = monotonic_seconds();
+    double t_last_report = t0;
+    while (!g_stop) {
+        double now = monotonic_seconds();
+        if (seconds > 0 && (now - t0) >= (double)seconds) break;
+        if (max_shares > 0 && (int)client.shares_accepted >= max_shares) break;
+
+        poll_accounted(&client, 20, g_batch_wake_r);
+        share_q_flush(&client);
+
+        if (client.have_job)
+            want_seq = client.job.seq;
+        if (dj_maintain_testnet(&feed, &client, &en2_alloc, scan_batch,
+                                want_seq, client.job.clean ? 1 : 0,
+                                &staged) != 0)
+            break;
+
+        pthread_mutex_lock(&feed.mu);
+        for (int i = 0; i < 2; i++) {
+            if (feed.slot[i].work.ready)
+                stratum_share_target(client.difficulty, feed.slot[i].work.target);
+        }
+        pthread_mutex_unlock(&feed.mu);
+
+        now = monotonic_seconds();
+        if (now - t_last_report >= 2.0) {
+            double dt = now - t0;
+            uint64_t hashes = atomic_load_explicit(&feed.hashes, memory_order_relaxed);
+            double hs = (dt > 1e-9) ? (double)hashes / dt : 0.0;
+            uint64_t st0 = 0;
+            int st_on = 0;
+            status_account_begin(&st0, &st_on);
+            printf("STATUS connected=1 jobs=%llu hashes=%llu H/s=%.0f threads=%d "
+                   "diff=%.8g shares_ok=%llu shares_bad=%llu pending=%d "
+                   "staged_overlap=%llu en2=%llu\n",
+                   (unsigned long long)client.jobs_seen,
+                   (unsigned long long)hashes, hs, threads, client.difficulty,
+                   (unsigned long long)client.shares_accepted,
+                   (unsigned long long)client.shares_rejected,
+                   client.submit_pending,
+                   (unsigned long long)staged,
+                   (unsigned long long)en2_alloc);
+            fflush(stdout);
+            status_account_end(st0, st_on);
+            t_last_report = now;
+        }
+    }
+
+    g_in_flight = 0;
+    dj_join(&feed, tids);
+    dj_account(&feed, ws, t_decide, 1);
+    share_q_flush(&client);
+    uint64_t drain_t0 = time_split_on() ? mono_ns() : 0;
+    int pending_left = stratum_submit_drain(&client, 3000);
+    if (drain_t0) {
+        uint64_t drain_t1 = mono_ns();
+        if (drain_t1 > drain_t0)
+            g_gap_end_drain_ns += drain_t1 - drain_t0;
+    }
+
+    double dt = monotonic_seconds() - t0;
+    if (dt < 1e-9) dt = 1e-9;
+    uint64_t hashes = atomic_load_explicit(&feed.hashes, memory_order_relaxed);
+    double hs = (double)hashes / dt;
+
+    printf("\n=== TESTNET SUMMARY ===\n");
+    printf("endpoint=%s:%d\n", host, port);
+    printf("authorized=%d\n", (int)client.authorized);
+    printf("jobs_seen=%llu\n", (unsigned long long)client.jobs_seen);
+    printf("jobs_staged_while_hashing=%llu\n", (unsigned long long)staged);
+    printf("difficulty=%.8g\n", client.difficulty);
+    printf("hashes=%llu\n", (unsigned long long)hashes);
+    printf("H/s=%.0f\n", hs);
+    printf("threads=%d\n", threads);
+    printf("dual_job=on\n");
+    printf("shares_submitted=%llu\n", (unsigned long long)client.shares_submitted);
+    printf("shares_accepted=%llu\n", (unsigned long long)client.shares_accepted);
+    printf("shares_rejected=%llu\n", (unsigned long long)client.shares_rejected);
+    printf("submit_pending=%d\n", pending_left);
+    printf("elapsed_s=%.2f\n", dt);
+    printf("expect_share_s@this_rate=%.2f\n",
+           client.difficulty * 4294967296.0 / (hs > 1.0 ? hs : 1.0));
+    dj_print_stats(&feed);
+    time_split_print(dt);
+    time_split_off();
+    dj_feed_destroy(&feed);
+    stratum_close(&client);
+
+    if (client.shares_accepted > 0) {
+        printf("RESULT: PASS (share accepted)\n");
+        return 0;
+    }
+    if (client.jobs_seen > 0 && hashes > 0) {
+        printf("RESULT: PASS (live jobs processed; no share in window — diff may be high)\n");
+        return 0;
+    }
+    printf("RESULT: FAIL\n");
+    return 1;
+}
+
+/*
  * Offline multi-thread soak. Prints periodic H/s so a short batch and a
  * sustained run can be compared. Does not open a socket.
  */
 static int run_soak(const uint32_t mid[8], const uint32_t w_be[16],
                     int seconds, int threads, double report_s) {
+    if (g_dual_job)
+        return run_soak_dual(mid, w_be, seconds, threads, report_s);
     if (seconds < 1) seconds = 1;
     if (report_s < 0.2) report_s = 0.2;
     const uint32_t chunk = 1u << 20;
@@ -2115,6 +3122,9 @@ static void poll_accounted(stratum_client_t *c, int timeout_ms, int wake_fd) {
 }
 static int run_testnet(const char *host, int port, const char *user, const char *pass,
                        double suggest_diff, int seconds, int max_shares, int threads) {
+    if (g_dual_job)
+        return run_testnet_dual(host, port, user, pass, suggest_diff,
+                                seconds, max_shares, threads);
     printf("\n=== TESTNET STRATUM ===\n");
     printf("endpoint=%s:%d user=%s suggest_diff=%.8g duration=%ds threads=%d\n",
            host, port, user, suggest_diff, seconds, threads);
@@ -2365,6 +3375,7 @@ static int run_testnet(const char *host, int port, const char *user, const char 
     printf("hashes=%llu\n", (unsigned long long)hashes);
     printf("H/s=%.0f\n", hs);
     printf("threads=%d\n", threads);
+    printf("dual_job=off\n");
     printf("shares_submitted=%llu\n", (unsigned long long)client.shares_submitted);
     printf("shares_accepted=%llu\n", (unsigned long long)client.shares_accepted);
     printf("shares_rejected=%llu\n", (unsigned long long)client.shares_rejected);
@@ -2398,6 +3409,7 @@ static void usage(const char *argv0) {
         "                         prints H/s every --report interval (default 2s)\n"
         "  %s --threads N         worker count (default: hw.physicalcpu)\n"
         "  %s --pin / --no-pin    macOS P-core QoS + affinity tags (default --pin)\n"
+        "  %s --dual-job off|on   E7 two hot midstates (default off, current single-job)\n"
         "  %s --testnet           mine BTCLab testnet3 (suggest_diff=0.001)\n"
         "  %s --stratum HOST:PORT --user USER [--pass PASS] [--suggest-diff D]\n"
         "                         [--seconds N] [--max-shares N] [--threads N]\n"
@@ -2408,7 +3420,7 @@ static void usage(const char *argv0) {
         "target check still uses mining.set_difficulty from the pool.\n"
         "\n"
         "Educational testnet only. No mainnet / AntPool.\n",
-        argv0, argv0, argv0, argv0, argv0, argv0, argv0);
+        argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 int main(int argc, char **argv) {
@@ -2472,6 +3484,14 @@ int main(int argc, char **argv) {
             g_pin_cores = 1;
         } else if (strcmp(argv[i], "--no-pin") == 0) {
             g_pin_cores = 0;
+        } else if (strcmp(argv[i], "--dual-job") == 0 && i + 1 < argc) {
+            const char *mode = argv[++i];
+            if (strcmp(mode, "on") == 0) g_dual_job = 1;
+            else if (strcmp(mode, "off") == 0) g_dual_job = 0;
+            else {
+                fprintf(stderr, "--dual-job requires off or on\n");
+                return 2;
+            }
         } else if (argv[i][0] >= '0' && argv[i][0] <= '9') {
             batch = (uint32_t)strtoul(argv[i], NULL, 10);
             if (batch == 0) batch = 2000000;
@@ -2490,6 +3510,7 @@ int main(int argc, char **argv) {
     printf("silicon-miner educational harness\n");
     printf("=================================\n");
     printf("THREADS=%d (%s)\n", threads, thread_src);
+    printf("DUAL_JOB=%s\n", g_dual_job ? "on" : "off");
     report_pin_policy(threads);
 
     if (soak_mode && (have_stratum || testnet_mode)) {
@@ -2536,7 +3557,9 @@ int main(int argc, char **argv) {
            batch, threads);
     time_split_reset();
     double t0 = monotonic_seconds();
-    int hit = mine_midstate_n(mid, w_be, 0u, batch, TARGET_NEVER, &found, threads);
+    int hit = g_dual_job
+        ? dual_mine_span(mid, w_be, 0u, batch, TARGET_NEVER, &found, threads)
+        : mine_midstate_n(mid, w_be, 0u, batch, TARGET_NEVER, &found, threads);
     double t1 = monotonic_seconds();
     double dt = t1 - t0;
     if (dt < 1e-9) dt = 1e-9;

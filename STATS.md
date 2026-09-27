@@ -125,7 +125,7 @@ Landed on `main` (PR #1 squash merge `86fe9cf`, 2026-09-26). TIME_SPLIT accounti
 | E4 | Job midstate staging while hashing | eng | Done / soak saw `staged_overlap=1` |
 | E5 | Async share submit | eng | Done / soak exercised path |
 | E6 | `exp/sha-pipe-schedule` | **formal experiment fork** | Not started |
-| E7 | `exp/dual-job` | **formal experiment fork** | Not started |
+| E7 | `exp/dual-job` | **formal experiment fork** | Fork open (`--dual-job off` or `on`). Not on main. Mac cells in section 13 are PLACEHOLDER. |
 
 Protocol: E6 and E7 each get their own branch, measure, and decision. Do not stack them.
 
@@ -459,4 +459,80 @@ Explicit `--threads 8` before the QoS split: **H/s=77561467** (~77.6 MH/s).
 
 Default 8T on the QoS-split build (no `--threads`, `./miner_test 2000000`): **H/s=70836580** (~70.8 MH/s).
 
-Short offline batches move around. Section 11 already recorded 8T timed batches at **88094085** (~88.1 MH/s) and **90991811** (~91.0 MH/s) the same day. **77.6** and **70.8 MH/s** are more short samples, not live regressions. The 120 s Stratum soaks are the comparison. E6 and E7 were not started.
+Short offline batches move around. Section 11 already recorded 8T timed batches at **88094085** (~88.1 MH/s) and **90991811** (~91.0 MH/s) the same day. **77.6** and **70.8 MH/s** are more short samples, not live regressions. The 120 s Stratum soaks are the comparison. E6 was not part of this soak. E7 is the separate fork in section 13.
+
+---
+
+## 13. E7 dual-job (formal experiment)
+
+**Not ordinary engineering.** This section belongs to the `exp/dual-job` fork. Do not squash-merge it onto `main` as a feature. E6 is a separate fork and is not in this branch. No mainnet, AntPool, or BTC spend. No energy numbers are filled in here.
+
+### Hypothesis
+
+E4 builds the next header's midstate into a side buffer while a batch hashes, but every worker is still on **one** job. When that job's nonce window ends, or a notify retires it, the cores wait out join, the switch, and the next `pthread_create`.
+
+E7 keeps **two midstate slots hot**. A worker whose slot cannot feed it claims the other slot and keeps calling the existing asm. Offline that asm is `_sha256d_mine_midstate`. On testnet it is still `sha256d_asm_one` (`sha256_compress`) plus the same C target check. `--dual-job off` (the default) is the single-job path from `main`. `--dual-job on` is the treatment, in the same binary.
+
+`underfeed` counts a slot whose armed window had fewer nonces than workers. `switches` counts a worker moving from one slot to the other. `install_while_live` counts a new header installed while the other slot was still hot. `idle_s` is average time workers waited with neither slot claimable. `jobs_staged_while_hashing` is still the count of distinct new job ids installed while the other slot was hot.
+
+### Expected effect size
+
+These are bounds for the coordinator, not measurements.
+
+The current default-thread baseline is section 12: 120 s on tn3, no `--threads` (`hw.physicalcpu`, 8 on MacBookPro18,3), `other` **0.42%** of wall, share **9.55%**, `early_share` **0**. Step 1 already finishes the slice after a share, so this fork does not change that policy or the MSW target check. A handful of job changes in 120 s is still well under 1% of wall.
+
+| Run | Expected H/s vs control | Why |
+|-----|-------------------------|-----|
+| Live tn3, 120 s, default threads | **about 0% to +1%** | Only the job-boundary wait is recoverable. A **0% to −2%** move is plausible if slot handoff shows up on the per-nonce scan. |
+| Offline timed batch (one span) | **about −2% to +1%** | Control is one asm call per thread. Treatment is the same span split across two slots. |
+| Offline `--soak` | **about 0% to +10%** | Control create/joins every 1M-nonce chunk. Treatment keeps the threads and refills the drained slot while the other slot is still hashing. |
+
+### How to measure (Mac)
+
+Leave the machine awake (`caffeinate -dims` or equivalent). Omit `--threads` so the harness uses its default (`hw.physicalcpu`, P+E). qemu H/s is not this table. The live command matches section 12, including `--suggest-diff 0.001`.
+
+```sh
+# control
+./miner_test --dual-job off
+./miner_test --dual-job off --soak 120 --report 2
+caffeinate -dims ./miner_test --dual-job off --testnet --seconds 120 --max-shares 0 --suggest-diff 0.001
+
+# treatment
+./miner_test --dual-job on
+./miner_test --dual-job on --soak 120 --report 2
+caffeinate -dims ./miner_test --dual-job on --testnet --seconds 120 --max-shares 0 --suggest-diff 0.001
+```
+
+Read `H/s`, `TIME_SPLIT` / `TIME_SPLIT_GAPS` / `BATCHES`, and on treatment the `DUAL_JOB` line (`switches`, `underfeed`, `install_while_live`, `idle_s`). Compare the live row to section 12 (~80.2 MH/s, other 0.42%, 8 threads). A `--suggest-diff 1` soak is optional; it is not the cell below.
+
+Correctness (not throughput): qemu-aarch64 self-test **PASS** for `--dual-job off` and `--dual-job on`, genesis nonce `7c2bac1d`.
+
+### Results (MacBookPro18,3)
+
+Coordinator fills these cells. Do not copy qemu H/s into them.
+
+| Mode | Offline timed batch H/s | Offline soak 120 s H/s | Live tn3 120 s H/s | `TIME_SPLIT` other % | `idle_s` | switches | underfeed | install_while_live |
+|------|-------------------------|------------------------|--------------------|----------------------|----------|----------|-----------|--------------------|
+| control `--dual-job off` | PLACEHOLDER | PLACEHOLDER | PLACEHOLDER | PLACEHOLDER | n/a | n/a | n/a | n/a |
+| treatment `--dual-job on` | PLACEHOLDER | PLACEHOLDER | PLACEHOLDER | PLACEHOLDER | PLACEHOLDER | PLACEHOLDER | PLACEHOLDER | PLACEHOLDER |
+
+| Energy | control | treatment |
+|--------|---------|-----------|
+| `ABS_PKG_W` | PLACEHOLDER | PLACEHOLDER |
+| `W_PER_HASH` | PLACEHOLDER | PLACEHOLDER |
+| `J_PER_HASH` | PLACEHOLDER | PLACEHOLDER |
+
+Live harness lines (paste; do not invent):
+
+```
+control:
+TIME_SPLIT ...
+TIME_SPLIT_GAPS ...
+BATCHES ...
+
+treatment:
+TIME_SPLIT ...
+TIME_SPLIT_GAPS ...
+BATCHES ...
+DUAL_JOB mode=on slots=2 switches= PLACEHOLDER underfeed= PLACEHOLDER install_while_live= PLACEHOLDER idle_s= PLACEHOLDER
+```

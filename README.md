@@ -92,6 +92,19 @@ make testnet
 - A worker that finds a share queues it immediately and finishes the rest of its nonce range. Siblings are not cancelled. The main thread writes `mining.submit` on the next poll (`stratum_submit_async`) and counts the reply later. A share does not roll extranonce2: the next batch continues the nonce cursor on the same header until the 32-bit nonce space wraps, a new job is staged, or `clean_jobs` cancels the scan.
 - Live session note: notify parsing must fully skip long `coinb1`/`coinb2` strings before reading `version`/`nbits`/`ntime` (truncated scan previously left ntime empty → pool “Difficulty too low”).
 
+## E7 dual-job (formal experiment)
+
+`--dual-job off` is the default and is the single-job path above. `--dual-job on` keeps **two midstate slots** live. A worker that finishes a slice claims whichever slot still has nonces, including the other header, without a join between those claims. The hash itself is still `_sha256d_mine_midstate` offline and `sha256d_asm_one` / `sha256_compress` on the testnet scan. A live share is queued and the slice finishes; it does not roll extranonce2. The target compare is the same one-word check as the single-job scan.
+
+This fork is an experiment. Do not squash-merge it as ordinary engineering. Measurement and empty Mac cells are in [STATS.md](STATS.md) section 13. qemu H/s is not an Apple Silicon result.
+
+```sh
+./miner_test --dual-job off
+./miner_test --dual-job on
+```
+
+On stop, the two open windows are cancelled (`BATCHES` `early_clean`). Windows that were fully claimed are `full`. Treatment runs also print `DUAL_JOB mode=on` with `switches`, `underfeed`, `install_while_live`, and `idle_s`.
+
 ## Metrics
 
 Recorded MacBookPro18,3 H/s, absolute package energy, and testnet soak: [STATS.md](STATS.md).
