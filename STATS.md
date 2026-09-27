@@ -125,7 +125,7 @@ Landed on `main` (PR #1 squash merge `86fe9cf`, 2026-09-26). TIME_SPLIT accounti
 | E4 | Job midstate staging while hashing | eng | Done / soak saw `staged_overlap=1` |
 | E5 | Async share submit | eng | Done / soak exercised path |
 | E6 | `exp/sha-pipe-schedule` | **formal experiment fork** | Not started |
-| E7 | `exp/dual-job` | **formal experiment fork** | Not started |
+| E7 | `exp/dual-job` | **formal experiment fork** | Measured 2026-09-27 CT (MacBookPro18,3, HEAD `7e8f4e7`). Draft PR #13 open. Not merged. Leave unmerged until Emshon decides. |
 
 Protocol: E6 and E7 each get their own branch, measure, and decision. Do not stack them.
 
@@ -459,4 +459,144 @@ Explicit `--threads 8` before the QoS split: **H/s=77561467** (~77.6 MH/s).
 
 Default 8T on the QoS-split build (no `--threads`, `./miner_test 2000000`): **H/s=70836580** (~70.8 MH/s).
 
-Short offline batches move around. Section 11 already recorded 8T timed batches at **88094085** (~88.1 MH/s) and **90991811** (~91.0 MH/s) the same day. **77.6** and **70.8 MH/s** are more short samples, not live regressions. The 120 s Stratum soaks are the comparison. E6 and E7 were not started.
+Short offline batches move around. Section 11 already recorded 8T timed batches at **88094085** (~88.1 MH/s) and **90991811** (~91.0 MH/s) the same day. **77.6** and **70.8 MH/s** are more short samples, not live regressions. The 120 s Stratum soaks are the comparison. E6 was not part of this soak. E7 is the separate fork in section 13.
+
+---
+
+## 13. E7 dual-job (formal experiment)
+
+**Not ordinary engineering.** This section belongs to the `exp/dual-job` fork. Do not squash-merge it onto `main` as a feature. E6 is a separate fork and is not in this branch. No mainnet, AntPool, or BTC spend. No energy numbers are filled in here.
+
+### Hypothesis
+
+E4 builds the next header's midstate into a side buffer while a batch hashes, but every worker is still on **one** job. When that job's nonce window ends, or a notify retires it, the cores wait out join, the switch, and the next `pthread_create`.
+
+E7 keeps **two midstate slots hot**. A worker whose slot cannot feed it claims the other slot and keeps calling the existing asm. Offline that asm is `_sha256d_mine_midstate`. On testnet it is still `sha256d_asm_one` (`sha256_compress`) plus the same C target check. `--dual-job off` (the default) is the single-job path from `main`. `--dual-job on` is the treatment, in the same binary.
+
+`underfeed` counts a slot whose armed window had fewer nonces than workers. `switches` counts a worker moving from one slot to the other. `install_while_live` counts a new header installed while the other slot was still hot. `idle_s` is average time workers waited with neither slot claimable. `jobs_staged_while_hashing` is still the count of distinct new job ids installed while the other slot was hot.
+
+### Expected effect size
+
+These are bounds for the coordinator, not measurements.
+
+The current default-thread baseline is section 12: 120 s on tn3, no `--threads` (`hw.physicalcpu`, 8 on MacBookPro18,3), `other` **0.42%** of wall, share **9.55%**, `early_share` **0**. Step 1 already finishes the slice after a share, so this fork does not change that policy or the MSW target check. A handful of job changes in 120 s is still well under 1% of wall.
+
+| Run | Expected H/s vs control | Why |
+|-----|-------------------------|-----|
+| Live tn3, 120 s, default threads | **about 0% to +1%** | Only the job-boundary wait is recoverable. A **0% to −2%** move is plausible if slot handoff shows up on the per-nonce scan. |
+| Offline timed batch (one span) | **about −2% to +1%** | Control is one asm call per thread. Treatment is the same span split across two slots. |
+| Offline `--soak` | **about 0% to +10%** | Control create/joins every 1M-nonce chunk. Treatment keeps the threads and refills the drained slot while the other slot is still hashing. |
+
+### How to measure (Mac)
+
+Leave the machine awake (`caffeinate -dims` or equivalent). Omit `--threads` so the harness uses its default (`hw.physicalcpu`, P+E). qemu H/s is not this table. The live command matches section 12, including `--suggest-diff 0.001`.
+
+```sh
+# control
+./miner_test --dual-job off
+./miner_test --dual-job off --soak 120 --report 2
+caffeinate -dims ./miner_test --dual-job off --testnet --seconds 120 --max-shares 0 --suggest-diff 0.001
+
+# treatment
+./miner_test --dual-job on
+./miner_test --dual-job on --soak 120 --report 2
+caffeinate -dims ./miner_test --dual-job on --testnet --seconds 120 --max-shares 0 --suggest-diff 0.001
+```
+
+Read `H/s`, `TIME_SPLIT` / `TIME_SPLIT_GAPS` / `BATCHES`, and on treatment the `DUAL_JOB` line (`switches`, `underfeed`, `install_while_live`, `idle_s`). Compare the live row to section 12 (~80.2 MH/s, other 0.42%, 8 threads). A `--suggest-diff 1` soak is optional; it is not the cell below.
+
+Correctness (not throughput): qemu-aarch64 self-test **PASS** for `--dual-job off` and `--dual-job on`, genesis nonce `7c2bac1d`.
+
+### Results (MacBookPro18,3)
+
+Measured 2026-09-27 CT, HEAD `7e8f4e7b581d5effff240fd883f3ff1829768b8b`. Default threads are 8 (`hw.physicalcpu`). qemu H/s is not in these cells. Energy was not measured.
+
+Summary (default 8T). Timed-batch `other` / `idle_s` / switches are the 8T treatment `DUAL_JOB` line; soak and live `other` are that run's `TIME_SPLIT` other.
+
+| Mode | Offline timed batch H/s | Offline soak 120 s H/s | Live tn3 120 s H/s | `TIME_SPLIT` other % (soak / live) | `idle_s` (timed / soak / live) | switches (timed / soak / live) | underfeed | install_while_live (timed / soak / live) |
+|------|-------------------------|------------------------|--------------------|-----------------------------------|--------------------------------|--------------------------------|-----------|------------------------------------------|
+| control `--dual-job off` | 75171014 (~75.2 MH/s) | 101124149 (~101.1 MH/s) | 68997622 (~69.0 MH/s) | 0.71% / 0.34% | n/a | n/a | n/a | n/a |
+| treatment `--dual-job on` | 93707539 (~93.7 MH/s, +24.7%) | 125091135 (~125.1 MH/s, +23.70%) | 100343446 (~100.3 MH/s, +45.43% vs this control) | 17.35% / 4.91% | 0.0000 / 20.8258 / 5.9124 | 1 / 77768 / 85892 | 0 / 0 / 0 | 0 / 0 / 4 |
+
+| Energy | control | treatment |
+|--------|---------|-----------|
+| `ABS_PKG_W` | not measured | not measured |
+| `W_PER_HASH` | not measured | not measured |
+| `J_PER_HASH` | not measured | not measured |
+
+#### Offline timed 2M
+
+| Mode | H/s | vs paired control |
+|------|-----|-------------------|
+| control 1T `--dual-job off` | **24203112** | — |
+| treatment 1T `--dual-job on` | **24102193** | **−0.42%** (flat) |
+| control default 8T `--dual-job off` | **75171014** (~75.2 MH/s) | — |
+| treatment default 8T `--dual-job on` | **93707539** (~93.7 MH/s) | **+24.7%** (short-bench noise; prefer the soaks) |
+
+8T treatment:
+
+```
+DUAL_JOB mode=on slots=2 switches=1 underfeed=0 install_while_live=0 idle_s=0.0000
+```
+
+#### Offline soak 120 s, default 8T
+
+| Mode | SOAK_AVG_H/s | `TIME_SPLIT` other | BATCHES | `DUAL_JOB` |
+|------|--------------|--------------------|---------|------------|
+| `--dual-job off` | **101124149** (~101.1 MH/s) | **0.71%** | started=**11573** early_share=**0** full=**11573** | n/a |
+| `--dual-job on` | **125091135** (~125.1 MH/s, **+23.70%**) | **17.35%** | started=**14317** early_share=**0** early_clean=**1** full=**14316** | switches=**77768** underfeed=**0** install_while_live=**0** idle_s=**20.8258** |
+
+```
+control:
+SOAK_AVG_H/s=101124149
+TIME_SPLIT_PCT other=0.71
+BATCHES started=11573 early_share=0 full=11573
+
+treatment:
+SOAK_AVG_H/s=125091135
+TIME_SPLIT_PCT other=17.35
+BATCHES started=14317 early_share=0 early_clean=1 full=14316
+DUAL_JOB mode=on slots=2 switches=77768 underfeed=0 install_while_live=0 idle_s=20.8258
+```
+
+#### Live tn3 120 s, `--suggest-diff 0.001`, default 8T, `caffeinate`
+
+```sh
+caffeinate -dims ./miner_test --dual-job off --testnet --seconds 120 --max-shares 0 --suggest-diff 0.001
+caffeinate -dims ./miner_test --dual-job on --testnet --seconds 120 --max-shares 0 --suggest-diff 0.001
+```
+
+| Field | control `--dual-job off` | treatment `--dual-job on` |
+|-------|--------------------------|---------------------------|
+| H/s | **68997622** (~69.0 MH/s) | **100343446** (~100.3 MH/s, **+45.43%** vs this control) |
+| Shares | **920** accepted / **924** submitted (**4** rejected) | **1489** accepted / **1492** submitted (**3** rejected) |
+| Jobs | seen=**6** staged=**5** | seen=**3** staged=**2** |
+| Difficulty | ended **0.16** | ended **0.16** |
+| `TIME_SPLIT_PCT` | hash=**87.38** share=**12.28** other=**0.34** | hash=**86.10** share=**8.99** other=**4.91** |
+| Gaps | wake_s=**0.1130** join_s=**0.1239** | wake_s=**0.0000** join_s=**0.0001** unexplained≈**5.8905** |
+| `BATCHES` | started=**3949** early_share=**0** early_clean=**3** full=**3946** avg_flight_s=**0.0303** hashes_per_flight=**2096948** | started=**5744** early_share=**0** early_clean=**4** full=**5740** avg_flight_s=**114.1216** hashes_per_flight=**2096532** |
+| Dual-job | `dual_job=off` | switches=**85892** underfeed=**0** install_while_live=**4** idle_s=**5.9124** |
+
+```
+control:
+TIME_SPLIT_PCT hash=87.38 share=12.28 other=0.34
+TIME_SPLIT_GAPS wake_s=0.1130 join_s=0.1239
+BATCHES started=3949 early_share=0 early_clean=3 full=3946 avg_flight_s=0.0303 hashes_per_flight=2096948
+dual_job=off
+
+treatment:
+TIME_SPLIT_PCT hash=86.10 share=8.99 other=4.91
+TIME_SPLIT_GAPS wake_s=0.0000 join_s=0.0001 unexplained≈5.8905
+BATCHES started=5744 early_share=0 early_clean=4 full=5740 avg_flight_s=114.1216 hashes_per_flight=2096532
+DUAL_JOB mode=on slots=2 switches=85892 underfeed=0 install_while_live=4 idle_s=5.9124
+```
+
+### Decision
+
+Offline soak (**+23.7%**, 101.1 → 125.1 MH/s) is the cleaner offline signal. The default-8T timed batch (**+24.7%**) is short-bench noise; the 1T pair was flat (**−0.42%**).
+
+Live treatment is **+45.43%** versus this control (69.0 → 100.3 MH/s; 68997622 → 100343446). This control sits below the section 12 Step 2 confirm (**80160173**, ~80.2 MH/s). Against that baseline, treatment is about **+25%** (~100.3 vs ~80.2).
+
+Treatment `TIME_SPLIT` / `BATCHES` show elevated `other` (soak **17.35%**, live **4.91%**), elevated `idle_s` (soak **20.8258**, live **5.9124**), and live `avg_flight_s`≈**114**. That is likely dual-job accounting skew: workers stay live across slot switches, so one flight covers the run. Treat it as an instrumentation caveat, not as proof that wall time was wasted. Live unexplained≈**5.8905** lines up with `idle_s`=**5.9124**. `underfeed` was **0** on the 8T timed batch, the offline soak, and the live soak.
+
+**Leave PR #13 unmerged** as a formal experiment until Emshon decides. Do not squash-merge it as ordinary engineering. Numbers recorded.
