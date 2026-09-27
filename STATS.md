@@ -8,10 +8,10 @@ All numbers below are from **2026-09-26** unless noted. Machine for real H/s and
 
 | Kind | What it measures | Notes |
 |------|------------------|-------|
-| Offline timed batch | Midstate hash loop (`miner_test` / `--metrics`) | Highest raw H/s; no Stratum |
-| Offline soak (`--soak`) | Sustained offline hashing | Thermal/steady-state without pool |
-| Absolute energy (`measure.sh`) | Package watts during work window | Needs `sudo` for `powermetrics` |
-| Live Stratum soak (`--testnet`) | notify → hash → submit on a real pool | Lower H/s than offline (jobs, shares, submit) |
+| Offline timed batch | Midstate hash loop (`_sha256d_mine_midstate`, `miner_test` / `--metrics`) | Highest raw H/s; no Stratum |
+| Offline soak (`--soak`) | Sustained `_sha256d_mine_midstate` | Thermal/steady-state without pool |
+| Absolute energy (`measure.sh`) | Package watts during work window | v1 metric: W, W/hash, J/hash. Needs `sudo` for `powermetrics` |
+| Live Stratum soak (`--testnet`) | Header build, then per-nonce `sha256_compress` / `sha256d_asm_one`, then submit | Lower H/s than offline (jobs, shares, submit). The share hasher is the compress entry |
 
 **Energy definition (v1):** report absolute package W, W/hash, and J/hash from `powermetrics` (or equivalent) during the work window. Idle baseline is context only. Shared-SoC caveat is a footnote, not a reason to omit absolute numbers.
 
@@ -108,7 +108,7 @@ Later same-day live soaks (different vardiff and share counts) are in sections 9
 
 ## 6. Engineering vs formal experiments (status)
 
-Landed on `main` (PR #1 squash merge `86fe9cf`, 2026-09-26). TIME_SPLIT accounting landed (PR #3, `6d37fb6`, 2026-09-26). Wake-on-complete landed (PR #6, `36b83c5`, 2026-09-26); the post-fix Mac soak is in section 10. Step 1 (share check + finish-the-slice) landed (PR #8, `a4ad0ba`, 2026-09-27); the Mac soak is in section 11. Step 2 (default threads = all physical cores) landed (PR #10, `6312feb`, 2026-09-27); the Mac 8T soaks are in section 12.
+Landed on `main` (PR #1 squash merge `86fe9cf`, 2026-09-26). TIME_SPLIT accounting landed (PR #3, `6d37fb6`, 2026-09-26). Wake-on-complete landed (PR #6, `36b83c5`, 2026-09-26); the post-fix Mac soak is in section 10. Step 1 (share check + finish-the-slice) landed (PR #8, `a4ad0ba`, 2026-09-27); the Mac soak is in section 11. Step 2 (default threads = all physical cores) landed (PR #10, `6312feb`, 2026-09-27); the Mac 8T soaks are in section 12. E6 (SHA-pipe schedule A/B) was measured in PR #12 and closed without merge; schedule A stays on `main`. E7 (dual-job) was squash-merged as PR #13 / `8c5287f` (2026-09-27); Mac numbers are in section 13. `--dual-job` still defaults off.
 
 | ID | Item | Kind | Status |
 |----|------|------|--------|
@@ -124,10 +124,10 @@ Landed on `main` (PR #1 squash merge `86fe9cf`, 2026-09-26). TIME_SPLIT accounti
 | E3 | Multi-thread `measure.sh` | eng | Done (MT peak watts TBD) |
 | E4 | Job midstate staging while hashing | eng | Done / soak saw `staged_overlap=1` |
 | E5 | Async share submit | eng | Done / soak exercised path |
-| E6 | `exp/sha-pipe-schedule` | **formal experiment fork** | Not started |
-| E7 | `exp/dual-job` | **formal experiment fork** | Measured 2026-09-27 CT (MacBookPro18,3, HEAD `7e8f4e7`). Draft PR #13 open. Not merged. Leave unmerged until Emshon decides. |
+| E6 | SHA-pipe schedule A/B (`exp/sha-pipe-schedule`) | formal experiment, closed | Measured 2026-09-27 CT (PR #12, HEAD `550c0c1`). Offline 1T was flat (schedule A **25.061 MH/s** vs B **24.957 MH/s**, **−0.42%**). Abandoned. Closed without merge. Prefer schedule A, which is what `main` ships. |
+| E7 | Dual-job hot midstates | feature on `main`, default off | Measured 2026-09-27 CT (MacBookPro18,3, experiment HEAD `7e8f4e7`). Emshon approved the merge. Squash-merged to `main` as PR #13 / `8c5287f`. `--dual-job off` is the default; `--dual-job on` is the treatment. Numbers in section 13. |
 
-Protocol: E6 and E7 each get their own branch, measure, and decision. Do not stack them.
+E6 and E7 were measured on separate branches and were not stacked. E6 schedule B was abandoned. E7 is on `main` with the flag defaulting off.
 
 ---
 
@@ -351,7 +351,7 @@ BATCHES started=3297 early_share=0 early_clean=2 full=3295 avg_flight_s=0.0363 h
 
 **Ops win vs the same-day baseline:** live H/s **+1.6%** (56.7 → 57.6 MH/s; 56696392 → 57614710) and `early_share` **633 → 0**. `hashes_per_flight` moved from **2056117** to **2097008**, next to the full `2<<20` assignment (2097152). Share-check wall moved **17.67% → 13.77%** and hash **82.06% → 85.84%**. The Step 1 run ended at a higher vardiff (**0.16** vs **0.08**) and still accepted every submit (788/788).
 
-The offline 6T timed batch (**72.7 → 62.7 MH/s**) is short-bench noise against that baseline, not the live result. Offline 8T was **88.1 → 91.0 MH/s** on the same kind of short batch. Wake stayed a fraction of a second (wake_s **0.0941 → 0.2129**). E6 and E7 were not started.
+The offline 6T timed batch (**72.7 → 62.7 MH/s**) is short-bench noise against that baseline, not the live result. Offline 8T was **88.1 → 91.0 MH/s** on the same kind of short batch. Wake stayed a fraction of a second (wake_s **0.0941 → 0.2129**). This soak predates the E6 measurement and the E7 merge (sections 6 and 13).
 
 ---
 
@@ -459,19 +459,19 @@ Explicit `--threads 8` before the QoS split: **H/s=77561467** (~77.6 MH/s).
 
 Default 8T on the QoS-split build (no `--threads`, `./miner_test 2000000`): **H/s=70836580** (~70.8 MH/s).
 
-Short offline batches move around. Section 11 already recorded 8T timed batches at **88094085** (~88.1 MH/s) and **90991811** (~91.0 MH/s) the same day. **77.6** and **70.8 MH/s** are more short samples, not live regressions. The 120 s Stratum soaks are the comparison. E6 was not part of this soak. E7 is the separate fork in section 13.
+Short offline batches move around. Section 11 already recorded 8T timed batches at **88094085** (~88.1 MH/s) and **90991811** (~91.0 MH/s) the same day. **77.6** and **70.8 MH/s** are more short samples, not live regressions. The 120 s Stratum soaks are the comparison. E6 was not in this soak. Dual-job (E7) landed later and was not on this build; its numbers are in section 13.
 
 ---
 
-## 13. E7 dual-job (formal experiment)
+## 13. E7 dual-job (on main, default off)
 
-**Not ordinary engineering.** This section belongs to the `exp/dual-job` fork. Do not squash-merge it onto `main` as a feature. E6 is a separate fork and is not in this branch. No mainnet, AntPool, or BTC spend. No energy numbers are filled in here.
+Squash-merged to `main` as PR #13 (`8c5287f`, 2026-09-27) after Emshon approved. Default remains `--dual-job off`. `--dual-job on` is the treatment. E6 (SHA-pipe schedule B) is a separate experiment: measured flat in PR #12 and closed without merge, so `main` keeps schedule A. No mainnet, AntPool, or BTC spend. No energy numbers are filled in here.
 
 ### Hypothesis
 
 E4 builds the next header's midstate into a side buffer while a batch hashes, but every worker is still on **one** job. When that job's nonce window ends, or a notify retires it, the cores wait out join, the switch, and the next `pthread_create`.
 
-E7 keeps **two midstate slots hot**. A worker whose slot cannot feed it claims the other slot and keeps calling the existing asm. Offline that asm is `_sha256d_mine_midstate`. On testnet it is still `sha256d_asm_one` (`sha256_compress`) plus the same C target check. `--dual-job off` (the default) is the single-job path from `main`. `--dual-job on` is the treatment, in the same binary.
+E7 keeps **two midstate slots hot**. A worker whose slot cannot feed it claims the other slot and keeps calling the existing asm. Offline that asm is `_sha256d_mine_midstate`. On testnet the share scan is still `sha256d_asm_one` (`sha256_compress`) plus the same C target check. `--dual-job off` (the default) is the single-job path. `--dual-job on` is the treatment, in the same binary.
 
 `underfeed` counts a slot whose armed window had fewer nonces than workers. `switches` counts a worker moving from one slot to the other. `install_while_live` counts a new header installed while the other slot was still hot. `idle_s` is average time workers waited with neither slot claimable. `jobs_staged_while_hashing` is still the count of distinct new job ids installed while the other slot was hot.
 
@@ -479,7 +479,7 @@ E7 keeps **two midstate slots hot**. A worker whose slot cannot feed it claims t
 
 These are bounds for the coordinator, not measurements.
 
-The current default-thread baseline is section 12: 120 s on tn3, no `--threads` (`hw.physicalcpu`, 8 on MacBookPro18,3), `other` **0.42%** of wall, share **9.55%**, `early_share` **0**. Step 1 already finishes the slice after a share, so this fork does not change that policy or the MSW target check. A handful of job changes in 120 s is still well under 1% of wall.
+The current default-thread baseline is section 12: 120 s on tn3, no `--threads` (`hw.physicalcpu`, 8 on MacBookPro18,3), `other` **0.42%** of wall, share **9.55%**, `early_share` **0**. Step 1 already finishes the slice after a share, so dual-job does not change that policy or the MSW target check. A handful of job changes in 120 s is still well under 1% of wall.
 
 | Run | Expected H/s vs control | Why |
 |-----|-------------------------|-----|
@@ -599,4 +599,8 @@ Live treatment is **+45.43%** versus this control (69.0 → 100.3 MH/s; 68997622
 
 Treatment `TIME_SPLIT` / `BATCHES` show elevated `other` (soak **17.35%**, live **4.91%**), elevated `idle_s` (soak **20.8258**, live **5.9124**), and live `avg_flight_s`≈**114**. That is likely dual-job accounting skew: workers stay live across slot switches, so one flight covers the run. Treat it as an instrumentation caveat, not as proof that wall time was wasted. Live unexplained≈**5.8905** lines up with `idle_s`=**5.9124**. `underfeed` was **0** on the 8T timed batch, the offline soak, and the live soak.
 
-**Leave PR #13 unmerged** as a formal experiment until Emshon decides. Do not squash-merge it as ordinary engineering. Numbers recorded.
+**Decision:** Emshon approved the merge. Squash-merged to `main` as PR #13 / `8c5287f` (2026-09-27). Default stays `--dual-job off`. Treatment is `--dual-job on`. Numbers above are from the pre-merge measure (HEAD `7e8f4e7`).
+
+### Post-merge confirm soak
+
+A later Mac soak on `main` (`8c5287f`) with `--dual-job on`, about **60 s**, printed about **95.8 MH/s**, `early_share` **0**, `underfeed` **0**, and share wall about **9%**. Same class as the section 13 live treatment (~100 MH/s) and above the Step 2 confirm (~80 MH/s).

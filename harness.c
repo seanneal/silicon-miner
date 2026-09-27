@@ -1,16 +1,18 @@
 /*
  * harness.c — C only outside the hash path.
  * Tests, timing, metrics glue, threads, and optional testnet Stratum mining loop.
- * Hash path remains pure ARM64 asm (sha256d_mine.s). Workers call
+ * Hash path remains pure ARM64 asm (sha256d_mine.s). Offline workers call
  * _sha256d_mine_midstate on disjoint nonce ranges. Stratum share checks are a
  * target inequality, so that loop partitions the same way and hashes each
- * slice with the existing asm compress (sha256d_asm_one). A live share is
- * queued and the slice finishes; it does not cancel siblings or roll
- * extranonce2. TIME_SPLIT (mono_clock.h) accounts wall time around those calls.
+ * slice with the existing asm compress (sha256d_asm_one / sha256_compress).
+ * A live share is queued and the slice finishes; it does not cancel siblings
+ * or roll extranonce2. TIME_SPLIT (mono_clock.h) accounts wall time around
+ * those calls.
  *
- * E7 (--dual-job on) is a formal experiment: two midstate slots stay live and
- * a worker whose slot runs dry claims the other one. Default --dual-job off
- * is the single-job path. The asm hash path is not rewritten.
+ * --dual-job is optional and defaults off (one live job). --dual-job on keeps
+ * two hot midstate slots; C hands a dry slot's worker to the other slot.
+ * Both slots use the same asm (offline _sha256d_mine_midstate, live share
+ * scan sha256d_asm_one). Merged from E7 as PR #13 (8c5287f).
  */
 #include <stdio.h>
 #include <stdint.h>
@@ -93,7 +95,7 @@ static void on_sigint(int sig) { (void)sig; g_stop = 1; }
 
 /* Default on. --no-pin clears it. macOS only; Linux reports PIN=na. */
 static int g_pin_cores = 1;
-/* E7. Default off: one live job, same as main. --dual-job on keeps two. */
+/* Optional dual-job. Default off: one live job. --dual-job on keeps two slots. */
 static int g_dual_job = 0;
 /* Set by the testnet loop so a clean_jobs notify stops stale hashing.
  * Not checked on every nonce: a share-path load here was pure overhead.
@@ -2046,11 +2048,12 @@ static int selftest_batch_wake(int threads) {
 }
 
 /*
- * E7 dual-job feed.
+ * Dual-job feed (optional; default off; two job slots). On main since PR #13.
  * Two slots, each with its own midstate. Workers claim a slice and call the
- * existing asm (mine: _sha256d_mine_midstate, testnet: sha256d_asm_one).
- * When a slot cannot fill the workers, the next claim takes the other slot.
- * No join between those claims. --dual-job off does not call this.
+ * existing asm (offline: _sha256d_mine_midstate, testnet share scan:
+ * sha256d_asm_one / sha256_compress). C does the slot handoff: when a slot
+ * cannot fill the workers, the next claim takes the other slot. No join
+ * between those claims. --dual-job off does not call this.
  * Live shares match Step 1: queue the hit, finish the slice, do not roll
  * extranonce2. The target compare is the same MSW check as the single-job scan.
  */
@@ -3409,7 +3412,7 @@ static void usage(const char *argv0) {
         "                         prints H/s every --report interval (default 2s)\n"
         "  %s --threads N         worker count (default: hw.physicalcpu)\n"
         "  %s --pin / --no-pin    macOS P-core QoS + affinity tags (default --pin)\n"
-        "  %s --dual-job off|on   E7 two hot midstates (default off, current single-job)\n"
+        "  %s --dual-job off|on   optional; default off; two job slots\n"
         "  %s --testnet           mine BTCLab testnet3 (suggest_diff=0.001)\n"
         "  %s --stratum HOST:PORT --user USER [--pass PASS] [--suggest-diff D]\n"
         "                         [--seconds N] [--max-shares N] [--threads N]\n"

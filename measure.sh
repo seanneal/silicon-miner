@@ -2,6 +2,10 @@
 # measure.sh — idle powermetrics baseline + multi-thread miner power sample
 # Needs sudo for powermetrics. If sudo fails, run the soak alone and report.
 #
+# v1 metric: absolute package W, W/hash, and J/hash during the work window.
+# The soak calls _sha256d_mine_midstate (offline). It is not the live
+# per-nonce sha256_compress / sha256d_asm_one share scan.
+#
 # The work window is an offline --soak (not a 2M-nonce blip) so package power
 # is sampled while hashes are in flight. Pass the same thread count the soak uses.
 #

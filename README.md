@@ -1,8 +1,18 @@
 # silicon-miner
 
-Educational **Apple Silicon / M1** SHA-256d midstate miner.
+## What this is
 
-**Learning only — not for profit.** Testnet Stratum is supported for education. No mainnet AntPool, no BTC spend.
+Educational Apple Silicon (M1 / ARM64) Bitcoin SHA-256d miner. The goal is education, correctness, and using the silicon well. Profit is out of scope.
+
+The hash path is pure ARM64 assembly and uses the crypto-extension SHA instructions (`SHA256H`, `SHA256H2`, `SHA256SU0`, `SHA256SU1`). C stays outside that path: the harness, Stratum, sockets, and JSON. The live client is bare TCP.
+
+It connects to a public Bitcoin testnet Stratum pool (`tn3.btclab.dev`, or a similar testnet endpoint). Mainnet and paid pools stay off unless Emshon names a worker and password and says yes in chat.
+
+v1 metrics include absolute package energy during a work window: watts, W/hash, and J/hash from `powermetrics` (`measure.sh`, needs sudo). Recorded numbers are in [STATS.md](STATS.md).
+
+Offline soak and measure call `_sha256d_mine_midstate` (the dual-lane midstate loop). With `--dual-job on`, that same entry runs against two hot midstate slots, and C does the slot handoff. A live Stratum share scan builds the header in C, then hashes each nonce with `sha256_compress` / `sha256d_asm_one`.
+
+**Learning only.** Testnet Stratum is the supported pool path.
 
 ## Layout (flat)
 
@@ -13,7 +23,7 @@ Educational **Apple Silicon / M1** SHA-256d midstate miner.
 | `mono_clock.h` | `TIME_SPLIT` clock: `mach_absolute_time` on macOS, `CLOCK_MONOTONIC` elsewhere |
 | `stratum.c` / `stratum.h` | Bitcoin Stratum V1 client (subscribe / authorize / notify / submit) |
 | `Makefile` | Build / clean / metrics / testnet |
-| `measure.sh` | Optional energy sample via `powermetrics` (needs sudo) |
+| `measure.sh` | v1 absolute package energy (W, W/hash, J/hash via `powermetrics`; needs sudo) |
 | `README.md` | This file |
 
 ## Build & run (Apple Silicon Mac)
@@ -64,7 +74,7 @@ The hash path is Mach-O and uses Apple `@PAGE` syntax. On Linux, `make` rewrites
 
 ## Bitcoin testnet mining (Stratum)
 
-Connects to a **public testnet3** Stratum, builds headers from `mining.notify`, hashes with the asm midstate path, and submits shares.
+Connects to a **public testnet3** Stratum, builds headers from `mining.notify`, scans shares with per-nonce `sha256_compress` / `sha256d_asm_one`, and submits them. That live scan is the asm compress path. Offline soak and measure use `_sha256d_mine_midstate`.
 
 ```sh
 # BTCLab testnet3 (default). Username must be a tb1… address (`.` is rejected).
@@ -92,11 +102,11 @@ make testnet
 - A worker that finds a share queues it immediately and finishes the rest of its nonce range. Siblings are not cancelled. The main thread writes `mining.submit` on the next poll (`stratum_submit_async`) and counts the reply later. A share does not roll extranonce2: the next batch continues the nonce cursor on the same header until the 32-bit nonce space wraps, a new job is staged, or `clean_jobs` cancels the scan.
 - Live session note: notify parsing must fully skip long `coinb1`/`coinb2` strings before reading `version`/`nbits`/`ntime` (truncated scan previously left ntime empty → pool “Difficulty too low”).
 
-## E7 dual-job (formal experiment)
+## Dual-job (optional, default off)
 
-`--dual-job off` is the default and is the single-job path above. `--dual-job on` keeps **two midstate slots** live. A worker that finishes a slice claims whichever slot still has nonces, including the other header, without a join between those claims. The hash itself is still `_sha256d_mine_midstate` offline and `sha256d_asm_one` / `sha256_compress` on the testnet scan. A live share is queued and the slice finishes; it does not roll extranonce2. The target compare is the same one-word check as the single-job scan.
+On `main` since PR #13 (`8c5287f`, squash-merged 2026-09-27). `--dual-job off` is the default and keeps one live job. `--dual-job on` keeps **two hot midstate slots**. C does the slot handoff: a worker that finishes a slice claims whichever slot still has nonces, including the other header, without a join between those claims. Both slots call the same asm. Offline that entry is `_sha256d_mine_midstate`. On the testnet share scan it is `sha256d_asm_one` / `sha256_compress`, plus the same one-word target check. A live share is queued and the slice finishes; it does not roll extranonce2.
 
-This fork is an experiment. Do not squash-merge it as ordinary engineering. Mac results and the leave-unmerged decision are in [STATS.md](STATS.md) section 13. qemu H/s is not an Apple Silicon result.
+Mac results are in [STATS.md](STATS.md) section 13. qemu H/s is a correctness check, not an Apple Silicon result.
 
 ```sh
 ./miner_test --dual-job off
@@ -157,7 +167,7 @@ A live share is queued and that worker **finishes its slice**. Siblings finish t
 
 Compare an offline `--soak` (dual-lane `_sha256d_mine_midstate`) with a testnet run (per-nonce asm compress plus C target check). The H/s gap is in the buckets, which is the reason to read them before changing the scan.
 
-**Optional energy** (needs sudo for `powermetrics`). The sample window is an offline multi-thread soak, not a short nonce batch, so package watts are taken while hashes are in flight. `W_PER_HASH` and `J_PER_HASH` use absolute package power over `SOAK_AVG_H/s` (`J/hash = W / (hash/s)`).
+**Absolute package energy (v1).** `measure.sh` samples package watts with `powermetrics` during an offline multi-thread soak (needs sudo), not a short nonce batch, so the sample is taken while hashes are in flight. Report absolute package W, `W_PER_HASH`, and `J_PER_HASH` (`J/hash = W / (hash/s)` over `SOAK_AVG_H/s`). Idle watts are context only.
 
 ```sh
 ./measure.sh
@@ -171,10 +181,21 @@ Compare an offline `--soak` (dual-lane `_sha256d_mine_midstate`) with a testnet 
 |--------|------|
 | `_sha256_compress` | One 64-byte block; state in/out |
 | `_sha256d_genesis_selftest` | FIPS "abc" + genesis midstate mine; `0` = PASS |
-| `_sha256d_mine_midstate` | Dual-lane midstate loop. Next-group schedule sits under `SHA256H`/`H2`; cached midstate/IV are added in place |
+| `_sha256d_mine_midstate` | Dual-lane midstate loop (offline soak / measure, and both dual-job slots). Next-group schedule sits under `SHA256H`/`H2`; cached midstate/IV are added in place. This paired-lane order is schedule A |
+
+E6 tried a lane-major schedule B (`_sha256d_mine_midstate_e6b`) in PR #12. The offline 1-thread pair was flat, and the PR was closed without merge. `main` keeps schedule A.
+
+## Where the work stands
+
+| Item | Status |
+|------|--------|
+| Step 1, finish the nonce slice after a share | On `main` (PR #8, `a4ad0ba`) |
+| Step 2, default threads = `hw.physicalcpu` (P-core and E-core QoS) | On `main` (PR #10, `6312feb`). Default is 8 on a 6P+2E Mac |
+| E6 SHA-pipe schedule A/B | Measured flat, abandoned. PR #12 closed without merge. Prefer schedule A |
+| E7 dual-job | On `main` (PR #13, `8c5287f`). Optional; `--dual-job` defaults off |
 
 ## Constraints
 
 - Hash path is **pure ARM64 assembly** — no C in the hash path
-- C is harness + Stratum only
-- **No mainnet pools / AntPool / paid mining**
+- C is the harness, Stratum, sockets, and JSON
+- Mainnet and paid pools stay off unless Emshon names a worker and password and says yes in chat
