@@ -1,9 +1,6 @@
 #define _DEFAULT_SOURCE
 /*
- * stratum.c — Bitcoin Stratum V1 over bare TCP (educational testnet miner).
- * Sockets and JSON only. After the header is built, the harness share scan
- * hashes each nonce with sha256_compress / sha256d_asm_one. Offline soak
- * uses _sha256d_mine_midstate.
+ * stratum.c — Bitcoin Stratum V1 over bare TCP (educational testnet miner)
  */
 #include "stratum.h"
 #include "mono_clock.h"

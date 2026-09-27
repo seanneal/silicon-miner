@@ -1,8 +1,6 @@
 /*
  * stratum.h — Bitcoin Stratum V1 client (testnet educational mining)
- * bare TCP, no TLS. Sockets and JSON live here. The live share scan builds a header,
- * then hashes each nonce with sha256_compress / sha256d_asm_one in the
- * harness. Offline soak uses _sha256d_mine_midstate.
+ * bare TCP, no TLS. Hash path stays in sha256d_mine.s.
  */
 #ifndef SILICON_MINER_STRATUM_H
 #define SILICON_MINER_STRATUM_H

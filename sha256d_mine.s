@@ -22,9 +22,6 @@
 //     latency covers it) and SU1 sits between sha256h and sha256h2. The next
 //     K window ld1 is after the add that consumed v31, still under that hash.
 //     First-SHA rounds 4–15 share one WK (only W3/nonce differs per lane).
-//     This paired-lane order is schedule A. E6 schedule B (lane-major,
-//     PR #12) measured flat on a 1-thread offline batch and was closed
-//     without merge. This file keeps schedule A.
 //   - Nonce splice: fixed block1 words pre-REV32'd; only W3 updated per nonce
 //   - Second-SHA (item 2) — precomputed vs per-nonce:
 //       PRECOMPUTED / shared across nonces + lanes:

@@ -82,7 +82,7 @@ stratum.o: stratum.c stratum.h mono_clock.h
 $(TARGET): $(OBJS)
 	$(CROSS) $(LDFLAGS) -o $@ $(OBJS)
 
-# Self-test + short multi-thread batch: --dual-job off, then --dual-job on.
+# Self-test + short multi-thread batch, control then E7 treatment.
 # H/s here is qemu, not M1.
 qemu-selftest: $(TARGET)
 	$(QEMU) -cpu max ./$(TARGET) --threads 2 --dual-job off 20000
