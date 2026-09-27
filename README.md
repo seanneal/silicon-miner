@@ -32,7 +32,7 @@ make clean
 
 `--threads N` splits a nonce span across N workers in C. Each worker calls `_sha256d_mine_midstate` on a disjoint range (even slices, so the asm stays on the dual-lane path). `N=1` is the original single call.
 
-Default N is `hw.perflevel0.physicalcpu` (Apple Silicon performance cores), then `hw.ncpu`, then `sysconf(_SC_NPROCESSORS_ONLN)`.
+Default N is `hw.physicalcpu` (every physical core), then `hw.ncpu`, then `sysconf(_SC_NPROCESSORS_ONLN)`. On Apple Silicon that is performance cores plus efficiency cores. MacBookPro18,3 is 6 P-cores + 2 E-cores, so the default is 8. `hw.perflevel0.physicalcpu` is only the P-cores and is no longer the default. `--threads N` still overrides it.
 
 Timing, `--metrics`, `--soak`, and the testnet loop all take `--threads`. Stratum share checks are a target inequality, so that search uses the same partition but hashes each slice with the existing asm compress (`sha256_compress` via `sha256d_asm_one`). `--metrics` prints `THREADS` and `ASM_H/s`.
 
@@ -40,10 +40,12 @@ Timing, `--metrics`, `--soak`, and the testnet loop all take `--threads`. Stratu
 
 Default `--pin`. `--no-pin` turns it off. There is no public API to bind a thread to a CPU index. Each mining thread does both of these:
 
-1. `pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE)` so the scheduler prefers performance cores.
+1. QoS via `pthread_set_qos_class_self_np`. Worker slots below `hw.perflevel0.physicalcpu` use `QOS_CLASS_USER_INTERACTIVE` so the scheduler prefers performance cores. Slots at or above that count use `QOS_CLASS_UTILITY` so those workers can run on efficiency cores instead of every thread contending for the P cluster. If perflevel0 is unavailable, every worker stays on `QOS_CLASS_USER_INTERACTIVE`.
 2. `thread_policy_set(..., THREAD_AFFINITY_POLICY)` with a distinct tag `1..N`. Tag 0 means no affinity. Distinct tags ask the scheduler to spread workers across L2 cache domains instead of packing them onto one core.
 
-Startup prints `PIN=on` or `PIN=off` or `PIN=na` (Linux). `PIN_QOS_RC` and `PIN_AFFINITY_RC` are on stderr.
+`--threads N` with N at or below the P-core count keeps the old all-performance-core QoS. Including the E-cores raises total H/s and can worsen W/hash (package watts per hash): the extra cores hash, and they are not as efficient per hash as the P-cores on this workload.
+
+Startup prints `PIN=on` or `PIN=off` or `PIN=na` (Linux). `PIN_QOS_RC`, `PIN_AFFINITY_RC`, `PIN_PCORES`, and `PIN_EWORKERS` are on stderr.
 
 ## Offline soak
 

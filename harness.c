@@ -499,11 +499,43 @@ static void time_split_print(double wall_s) {
     }
 }
 
+#ifdef __APPLE__
+static int apple_sysctl_int(const char *name) {
+    int n = 0;
+    size_t sz = sizeof n;
+    if (sysctlbyname(name, &n, &sz, NULL, 0) != 0 || n <= 0)
+        return 0;
+    return n;
+}
+
+/* P-core count. 0 if the sysctl is missing (not Apple Silicon perf levels). */
+static int perflevel0_physicalcpu(void) {
+    static int cached = -1;
+    if (cached < 0)
+        cached = apple_sysctl_int("hw.perflevel0.physicalcpu");
+    return cached;
+}
+
+/*
+ * Slots below the P-core count ask for performance cores. Further slots ask
+ * for QOS_CLASS_UTILITY, which the scheduler may place on efficiency cores.
+ * USER_INTERACTIVE on every worker oversubscribes the P cluster and fights
+ * the point of a hw.physicalcpu default. More cores, possibly worse W/hash.
+ */
+static qos_class_t worker_qos_for_index(int index) {
+    int pcores = perflevel0_physicalcpu();
+    if (pcores > 0 && index >= pcores)
+        return QOS_CLASS_UTILITY;
+    return QOS_CLASS_USER_INTERACTIVE;
+}
+#endif
+
 /*
  * Pin one mining thread.
  * macOS has no public "bind to CPU index" API. Two documented knobs:
- *   1. pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE) — scheduler
- *      prefers performance cores.
+ *   1. pthread_set_qos_class_self_np — USER_INTERACTIVE prefers P-cores;
+ *      UTILITY is used once the worker slot is past hw.perflevel0.physicalcpu
+ *      so those workers can run on E-cores.
  *   2. thread_policy_set(THREAD_AFFINITY_POLICY) with a non-zero tag —
  *      threads that share a tag prefer the same L2 cache; distinct tags
  *      (1..N, one per worker) ask the scheduler to spread them.
@@ -513,7 +545,7 @@ static void apply_worker_pin(int index) {
 #ifdef __APPLE__
     if (!g_pin_cores) return;
     if (index < 0) index = 0;
-    (void)pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    (void)pthread_set_qos_class_self_np(worker_qos_for_index(index), 0);
     thread_affinity_policy_data_t pol;
     pol.affinity_tag = index + 1;
     thread_port_t th = pthread_mach_thread_np(pthread_self());
@@ -531,6 +563,8 @@ static void report_pin_policy(int threads) {
         fprintf(stderr, "PIN_NOTE=--no-pin; workers are not affinity-tagged\n");
         return;
     }
+    int pcores = perflevel0_physicalcpu();
+    int eworkers = (pcores > 0 && threads > pcores) ? threads - pcores : 0;
     int qos_rc = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     thread_affinity_policy_data_t pol;
     pol.affinity_tag = 1;
@@ -539,12 +573,23 @@ static void report_pin_policy(int threads) {
                                               (thread_policy_t)&pol,
                                               THREAD_AFFINITY_POLICY_COUNT);
     printf("PIN=on\n");
-    fprintf(stderr,
-            "PIN_METHOD=QOS_CLASS_USER_INTERACTIVE + THREAD_AFFINITY_POLICY tags=1..%d\n"
-            "PIN_QOS_RC=%d PIN_AFFINITY_RC=%d\n"
-            "PIN_NOTE=QoS requests performance cores; distinct affinity tags spread workers. "
-            "Not a hard CPU-index pin (no public API for that).\n",
-            threads, qos_rc, (int)aff_rc);
+    if (eworkers > 0) {
+        fprintf(stderr,
+                "PIN_METHOD=slots<P QOS_CLASS_USER_INTERACTIVE; slots>=P QOS_CLASS_UTILITY; "
+                "THREAD_AFFINITY_POLICY tags=1..%d\n"
+                "PIN_QOS_RC=%d PIN_AFFINITY_RC=%d PIN_PCORES=%d PIN_EWORKERS=%d\n"
+                "PIN_NOTE=First %d workers request performance cores. The other %d request "
+                "QOS_CLASS_UTILITY so they can run on efficiency cores. Feeding E-cores "
+                "raises H/s and can worsen W/hash. Not a hard CPU-index pin.\n",
+                threads, qos_rc, (int)aff_rc, pcores, eworkers, pcores, eworkers);
+    } else {
+        fprintf(stderr,
+                "PIN_METHOD=QOS_CLASS_USER_INTERACTIVE + THREAD_AFFINITY_POLICY tags=1..%d\n"
+                "PIN_QOS_RC=%d PIN_AFFINITY_RC=%d PIN_PCORES=%d PIN_EWORKERS=0\n"
+                "PIN_NOTE=QoS requests performance cores; distinct affinity tags spread workers. "
+                "Not a hard CPU-index pin (no public API for that).\n",
+                threads, qos_rc, (int)aff_rc, pcores);
+    }
 #else
     (void)threads;
     printf("PIN=na\n");
@@ -616,17 +661,21 @@ static int clamp_threads(int threads) {
     return threads;
 }
 
-/* Performance cores on Apple Silicon, else hw.ncpu, else online processors. */
+/*
+ * All physical CPUs, else hw.ncpu, else online processors.
+ * On Apple Silicon hw.physicalcpu is P+E (8 on MacBookPro18,3: 6P+2E).
+ * hw.perflevel0.physicalcpu is P-cores only and is not the default.
+ * --threads N still overrides this.
+ */
 static int default_thread_count(const char **src) {
 #ifdef __APPLE__
-    int n = 0;
-    size_t sz = sizeof n;
-    if (sysctlbyname("hw.perflevel0.physicalcpu", &n, &sz, NULL, 0) == 0 && n > 0) {
-        if (src) *src = "default hw.perflevel0.physicalcpu";
+    int n = apple_sysctl_int("hw.physicalcpu");
+    if (n > 0) {
+        if (src) *src = "default hw.physicalcpu";
         return clamp_threads(n);
     }
-    sz = sizeof n;
-    if (sysctlbyname("hw.ncpu", &n, &sz, NULL, 0) == 0 && n > 0) {
+    n = apple_sysctl_int("hw.ncpu");
+    if (n > 0) {
         if (src) *src = "default hw.ncpu";
         return clamp_threads(n);
     }
@@ -2347,7 +2396,7 @@ static void usage(const char *argv0) {
         "  %s --metrics [N]       metrics harness\n"
         "  %s --soak SEC          offline multi-thread hash for SEC seconds\n"
         "                         prints H/s every --report interval (default 2s)\n"
-        "  %s --threads N         worker count (default: P-cores or hw.ncpu)\n"
+        "  %s --threads N         worker count (default: hw.physicalcpu)\n"
         "  %s --pin / --no-pin    macOS P-core QoS + affinity tags (default --pin)\n"
         "  %s --testnet           mine BTCLab testnet3 (suggest_diff=0.001)\n"
         "  %s --stratum HOST:PORT --user USER [--pass PASS] [--suggest-diff D]\n"

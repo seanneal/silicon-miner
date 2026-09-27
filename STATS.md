@@ -108,7 +108,7 @@ Later same-day live soaks (different vardiff and share counts) are in sections 9
 
 ## 6. Engineering vs formal experiments (status)
 
-Landed on `main` (PR #1 squash merge `86fe9cf`, 2026-09-26). TIME_SPLIT accounting landed (PR #3, `6d37fb6`, 2026-09-26). Wake-on-complete landed (PR #6, `36b83c5`, 2026-09-26); the post-fix Mac soak is in section 10. Step 1 (share check + finish-the-slice) landed (PR #8, `a4ad0ba`, 2026-09-27); the Mac soak is in section 11.
+Landed on `main` (PR #1 squash merge `86fe9cf`, 2026-09-26). TIME_SPLIT accounting landed (PR #3, `6d37fb6`, 2026-09-26). Wake-on-complete landed (PR #6, `36b83c5`, 2026-09-26); the post-fix Mac soak is in section 10. Step 1 (share check + finish-the-slice) landed (PR #8, `a4ad0ba`, 2026-09-27); the Mac soak is in section 11. Step 2 (default threads = all physical cores) is this change; the Mac 8T soak is in section 12.
 
 | ID | Item | Kind | Status |
 |----|------|------|--------|
@@ -118,7 +118,8 @@ Landed on `main` (PR #1 squash merge `86fe9cf`, 2026-09-26). TIME_SPLIT accounti
 | — | TIME_SPLIT_GAPS (split `other`) | eng | Mac soaks in section 10 (PR #5 pre-fix; PR #6 post-fix) |
 | — | In-flight wake-on-complete | eng | Done / on main (PR #6); Mac soak in section 10 |
 | — | Step 1 share check + finish slice | eng | Done / on main (PR #8); Mac soak in section 11 |
-| E1 | P-core pin (`--pin` / `--no-pin`) | eng | Done / exercised on Mac |
+| — | Default threads = `hw.physicalcpu` (P+E) | eng | This change; Mac 8T soak in section 12 |
+| E1 | P-core pin (`--pin` / `--no-pin`) | eng | Done / exercised on Mac. Slots past perflevel0 use UTILITY QoS (section 12) |
 | E2 | Offline `--soak` | eng | Done |
 | E3 | Multi-thread `measure.sh` | eng | Done (MT peak watts TBD) |
 | E4 | Job midstate staging while hashing | eng | Done / soak saw `staged_overlap=1` |
@@ -143,7 +144,7 @@ Protocol: E6 and E7 each get their own branch, measure, and decision. Do not sta
 ```sh
 git pull
 make
-./miner_test                  # self-test + timed batch
+./miner_test                  # self-test + timed batch (default threads = hw.physicalcpu)
 ./miner_test --threads 4 5000000
 ./miner_test --soak 60 --threads 4 --report 2
 sudo ./measure.sh --threads 4 --seconds 20
@@ -151,6 +152,8 @@ sudo ./measure.sh --threads 4 --seconds 20
 ```
 
 Keep the machine awake for long runs (`caffeinate -dims` or equivalent).
+
+Omitting `--threads` uses `hw.physicalcpu` (8 on this 6P+2E Mac). `--threads 6` is the old P-core-only count.
 
 ---
 
@@ -349,3 +352,73 @@ BATCHES started=3297 early_share=0 early_clean=2 full=3295 avg_flight_s=0.0363 h
 **Ops win vs the same-day baseline:** live H/s **+1.6%** (56.7 → 57.6 MH/s; 56696392 → 57614710) and `early_share` **633 → 0**. `hashes_per_flight` moved from **2056117** to **2097008**, next to the full `2<<20` assignment (2097152). Share-check wall moved **17.67% → 13.77%** and hash **82.06% → 85.84%**. The Step 1 run ended at a higher vardiff (**0.16** vs **0.08**) and still accepted every submit (788/788).
 
 The offline 6T timed batch (**72.7 → 62.7 MH/s**) is short-bench noise against that baseline, not the live result. Offline 8T was **88.1 → 91.0 MH/s** on the same kind of short batch. Wake stayed a fraction of a second (wake_s **0.0941 → 0.2129**). E6 and E7 were not started.
+
+---
+
+## 12. Step 2 — default workers on all physical cores
+
+Ordinary engineering (not E6 / E7). Asm hash path (`sha256d_mine.s`) was not changed. Mac numbers below are from MacBookPro18,3 (6P+2E), 2026-09-27 CT. qemu H/s is not used here.
+
+What this change does:
+
+- Default worker count is `hw.physicalcpu` (all physical cores), then `hw.ncpu`, then `sysconf(_SC_NPROCESSORS_ONLN)`. On this machine that is **8**. `hw.perflevel0.physicalcpu` (**6**, P-cores only) is no longer the default. `--threads N` still overrides.
+- Pin stays on. Worker slots below the P-core count still request `QOS_CLASS_USER_INTERACTIVE`. Slots at or past that count request `QOS_CLASS_UTILITY` so the scheduler can place them on efficiency cores instead of eight threads all asking for six P-cores. Including E-cores is the H/s win and can worsen W/hash.
+
+The live 8T row below was measured with explicit `--threads 8` on `main` after #8, before this QoS split. On that build every worker still requested `QOS_CLASS_USER_INTERACTIVE`. It is the evidence that eight workers beat the Step 1 six-thread soak. The default after this change matches that worker count.
+
+Sysctl on the soak machine:
+
+| Key | Value |
+|-----|-------|
+| `hw.perflevel0.physicalcpu` | **6** (P-cores) |
+| `hw.perflevel1.physicalcpu` | **2** (E-cores) |
+| `hw.ncpu` | **8** |
+
+Same soak shape as section 11. Step 1 passed `--threads 6`. Step 2 passed `--threads 8` because the default was still the P-core count:
+
+```sh
+caffeinate -dims ./miner_test --testnet --seconds 120 --max-shares 0 --suggest-diff 0.001
+```
+
+### Step 1 baseline (6T, after #8)
+
+Same soak as section 11. Repeated here as the comparison point.
+
+| Field | Value |
+|-------|-------|
+| Live H/s | **57614710** (~57.6 MH/s) |
+| Threads | **6** |
+| Shares | **788** accepted / **788** submitted |
+| `TIME_SPLIT_PCT` | hash=**85.84** share=**13.77** other=**0.39** |
+| `BATCHES` | started=**3297** early_share=**0** hashes_per_flight=**2097008** |
+
+### Step 2 live soak (8T explicit, main after #8)
+
+| Field | Value |
+|-------|-------|
+| Machine | MacBookPro18,3 (6P+2E) |
+| Live command | `--testnet --seconds 120 --max-shares 0 --threads 8 --suggest-diff 0.001` |
+| Live H/s | **71724915** (~71.7 MH/s) |
+| Hashes | **8607004160** |
+| Threads | **8** |
+| Difficulty | ended **0.16** (vardiff) |
+| Shares | **1013** accepted / **1018** submitted |
+| `TIME_SPLIT_PCT` | hash=**86.94** share=**12.68** other=**0.38** |
+| `TIME_SPLIT_GAPS_DETAIL` | wake_s=**0.1599** join_s=**0.1192** |
+| `BATCHES` | started=**4105** early_share=**0** early_clean=**2** full=**4103** avg_flight_s=**0.0291** hashes_per_flight=**2096712** |
+
+Reported lines:
+
+```
+TIME_SPLIT_PCT hash=86.94 share=12.68 other=0.38
+TIME_SPLIT_GAPS_DETAIL wake_s=0.1599 join_s=0.1192
+BATCHES started=4105 early_share=0 early_clean=2 full=4103 avg_flight_s=0.0291 hashes_per_flight=2096712
+```
+
+**Ops win vs the Step 1 6T soak:** live H/s **+24.5%** (57.6 → 71.7 MH/s; 57614710 → 71724915). Hash wall stayed in the mid-80s (85.84% → 86.94%). Share wall went 13.77% → 12.68%. `early_share` stayed **0**. `hashes_per_flight` stayed next to the full `2<<20` assignment (2096712 vs 2097152). Wake stayed a fraction of a second (wake_s **0.1599**, join_s **0.1192**). Vardiff still ended at **0.16**.
+
+### Offline 2M-nonce (noisy)
+
+`./miner_test --threads 8 2000000` on this pull: **H/s=77561467** (~77.6 MH/s).
+
+Short offline batches move around. Section 11 already recorded 8T timed batches at **88094085** (~88.1 MH/s) and **90991811** (~91.0 MH/s) the same day. **77.6 MH/s** is another short sample, not a live regression. The 120 s Stratum soak is the comparison. E6 and E7 were not started.
