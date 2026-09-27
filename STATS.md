@@ -100,23 +100,23 @@ Multi-thread energy via `./measure.sh --threads N` was enabled in E3 but a multi
 
 Rejects were consistent with stale work on job change, not bad digests.
 
-**Interpretation:** ~39 MH/s is the best **live Stratum soak** so far. Offline batches at 4T/8T are higher because they do not pay job/share/submit overhead.
+**Interpretation:** ~39 MH/s is this early live Stratum soak. Offline batches at 4T/8T are higher because they do not pay job/share/submit overhead.
 
-A later same-day live soak on the TIME_SPLIT build (different vardiff and share counts) is in section 9.
+Later same-day live soaks (different vardiff and share counts) are in sections 9 and 10. The post–wake-pipe soak is in section 10.
 
 ---
 
 ## 6. Engineering vs formal experiments (status)
 
-Landed on `main` (PR #1 squash merge `86fe9cf`, 2026-09-26). TIME_SPLIT accounting landed (PR #3, `6d37fb6`, 2026-09-26).
+Landed on `main` (PR #1 squash merge `86fe9cf`, 2026-09-26). TIME_SPLIT accounting landed (PR #3, `6d37fb6`, 2026-09-26). Wake-on-complete landed (PR #6, `36b83c5`, 2026-09-26); the post-fix Mac soak is in section 10.
 
 | ID | Item | Kind | Status |
 |----|------|------|--------|
 | — | Multi-thread C nonce ranges | eng | Done / on main |
 | — | Dual-lane asm schedule | eng | Done / on main |
 | — | TIME_SPLIT wall accounting | eng | Done / on main (PR #3); Mac live soak in section 9 |
-| — | TIME_SPLIT_GAPS (split `other`) | eng | Mac soak recorded (section 10, PR #5) |
-| — | In-flight wake-on-complete | eng | This PR; Mac re-measure pending (section 10) |
+| — | TIME_SPLIT_GAPS (split `other`) | eng | Mac soaks in section 10 (PR #5 pre-fix; PR #6 post-fix) |
+| — | In-flight wake-on-complete | eng | Done / on main (PR #6); Mac soak in section 10 |
 | E1 | P-core pin (`--pin` / `--no-pin`) | eng | Done / exercised on Mac |
 | E2 | Offline `--soak` | eng | Done |
 | E3 | Multi-thread `measure.sh` | eng | Done (MT peak watts TBD) |
@@ -219,13 +219,50 @@ Measured 2026-09-26 on the TIME_SPLIT_GAPS build (PR #5, merged to `main`). 120 
 
 **Interpretation:** teardown is almost all `wake_s`. After a ~23 ms flight the main thread was still inside the ~20 ms in-flight `select`, so it noticed the batch ~8 ms late. That tail times thousands of batches is ~26% of wall. Job / midstate / submit were not the gap.
 
-A wake/poll fix is in this PR. The last finishing worker writes a self-pipe that the same in-flight `select` watches, so main wakes when the batch ends instead of waiting out the poll timeout. Stratum overlap (E4/E5) stays: socket readability still wakes that `select`, and midstate staging plus async submit are unchanged. **Mac re-measure is pending.** The ~65 MH/s row above is the PR #5 soak, not a post-fix rate. On the next soak, `wake_s` and teardown should fall toward thread-wakeup latency (near 0% of wall) while `TIME_SPLIT_GAPS` still prints.
+This ~65 MH/s row is the pre-fix soak. In the wake-pipe (PR #6), the last finishing worker writes a self-pipe that the same in-flight `select` watches, so main wakes when the batch ends instead of waiting out the poll timeout. Stratum overlap (E4/E5) stays: socket readability still wakes that `select`, and midstate staging plus async submit are unchanged. The Mac re-measure is the next subsection.
+
+### Live Stratum soak (MacBookPro18,3) — post–PR #6 wake-pipe
+
+Measured 2026-09-26 CT on MacBookPro18,3. Branch soaked: `cursor/batch-wake-pipe-8661` (squash-merged to `main` as PR #6 / `36b83c5`). Same command as the PR #5 soak above.
 
 ```sh
 caffeinate -dims ./miner_test --testnet --seconds 120 --max-shares 0 --threads 6 --suggest-diff 0.001
 ```
 
-Offline comparison on the same build (not a substitute for the live gap split):
+| Field | Value |
+|-------|-------|
+| Endpoint | `tn3.btclab.dev:3333` |
+| Duration | **120.02 s** (`elapsed_s=120.02`) |
+| Threads | **6** |
+| H/s | **57765393** (~57.8 MH/s) |
+| Hashes | **6932998022** |
+| Jobs seen | **5** |
+| `jobs_staged_while_hashing` | **4** |
+| Difficulty | ended **0.16** (vardiff) |
+| Shares | **780** submitted / **778** accepted / **2** rejected |
+| `TIME_SPLIT_PCT` | hash=**82.71** share=**17.01** other=**0.28** |
+| `TIME_SPLIT_GAPS_PCT` | batch_setup=**0.13** teardown=**0.14**; other named gaps ≈ 0 |
+| `TIME_SPLIT_GAPS_DETAIL` | wake_s=**0.1107** join_s=**0.0577** |
+| `BATCHES` | started=**3372** early_share=**651** early_clean=**3** full=**2718** avg_flight_s=**0.0355** hashes_per_flight=**2056049** |
+| Result | **PASS** |
+
+Harness lines:
+
+```
+TIME_SPLIT hash_s=99.2738 share_s=20.4109 poll_s=0.0000 midstate_s=0.0033 submit_s=0.0003 other_s=0.3316
+TIME_SPLIT_PCT hash=82.71 share=17.01 poll=0.00 midstate=0.00 submit=0.00 other=0.28
+TIME_SPLIT_CPU hash_s=457.8899 share_s=94.1431 submit_s=0.0014
+TIME_SPLIT_FLIGHT flight_s=119.6850
+TIME_SPLIT_OVERLAP poll_busy_s=0.1903 poll_wait_s=119.4737 midstate_s=0.0000 submit_s=0.0748
+TIME_SPLIT_GAPS batch_setup_s=0.1503 teardown_s=0.1695 share_restart_s=0.0010 cancel_restart_s=0.0000 end_drain_s=0.0000 status_s=0.0000 unexplained_s=0.0109
+TIME_SPLIT_GAPS_PCT batch_setup=0.13 teardown=0.14 share_restart=0.00 cancel_restart=0.00 end_drain=0.00 status=0.00 unexplained=0.01
+TIME_SPLIT_GAPS_DETAIL wake_s=0.1107 join_s=0.0577
+BATCHES started=3372 early_share=651 early_clean=3 full=2718 avg_flight_s=0.0355 hashes_per_flight=2056049
+```
+
+**Interpretation:** The wake tax is gone. Against the PR #5 pre-fix soak above (~65 MH/s, other **26.08%**, wake_s=**31.03**): wake_s **31.03 s → 0.11 s** and other **26% → 0.28%**. Teardown is **0.14%** of wall (wake_s=0.1107, join_s=0.0577). Absolute H/s on this run was **~57.8 MH/s**, with share-check at **~17%** of wall (vardiff ended at **0.16**, 780 submits), versus **~65 MH/s** on the pre-fix soak (share **8.81%** of wall).
+
+Offline comparison commands (not a substitute for the live gap split):
 
 ```sh
 ./miner_test --threads 6 2000000
