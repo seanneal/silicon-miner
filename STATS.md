@@ -117,6 +117,7 @@ Landed on `main` (PR #1 squash merge `86fe9cf`, 2026-09-26). TIME_SPLIT accounti
 | — | TIME_SPLIT wall accounting | eng | Done / on main (PR #3); Mac live soak in section 9 |
 | — | TIME_SPLIT_GAPS (split `other`) | eng | Mac soaks in section 10 (PR #5 pre-fix; PR #6 post-fix) |
 | — | In-flight wake-on-complete | eng | Done / on main (PR #6); Mac soak in section 10 |
+| — | Step 1 share check + finish slice | eng | Section 11; Mac soak **PLACEHOLDER** |
 | E1 | P-core pin (`--pin` / `--no-pin`) | eng | Done / exercised on Mac |
 | E2 | Offline `--soak` | eng | Done |
 | E3 | Multi-thread `measure.sh` | eng | Done (MT peak watts TBD) |
@@ -268,3 +269,65 @@ Offline comparison commands (not a substitute for the live gap split):
 ./miner_test --threads 6 2000000
 ./miner_test --soak 120 --threads 6 --report 2
 ```
+
+---
+
+## 11. Step 1 — share-path wall and early-share batches
+
+Ordinary engineering (not E6 / E7). Added 2026-09-27. Asm hash path (`sha256d_mine.s`) was not changed.
+
+What changed, so the coordinator soak has a baseline to compare with section 10:
+
+- The per-nonce share check compares `bswap32(digest[7])` to the top target word and reads the rest of the target only on a tie. It is the same Bitcoin integer compare as the old 32-byte walk (selftest oracle).
+- A live share is queued and that worker finishes its nonce range. Siblings are not cancelled. The batch does not roll extranonce2 just because a share hit; the nonce cursor continues on the same header until wrap, a new job, or `clean_jobs`.
+- `TIME_SPLIT` / `TIME_SPLIT_GAPS` / `BATCHES` still print. `early_share` on a live soak should drop (slices are no longer cut short by a hit). `share_restart_s` stays the short-batch fallback, not the common share path.
+- `--suggest-diff 0.001` is unchanged so a one-share proof still returns quickly. For a quieter H/s soak, pass `--suggest-diff 1`. That is only `mining.suggest_difficulty`; the check still uses the pool's `set_difficulty`.
+
+### Mac soak — PLACEHOLDER
+
+Coordinator fill-in. Do not treat qemu or this VM as Apple Silicon H/s.
+
+Same shape as section 10 so the share-path delta is comparable:
+
+```sh
+caffeinate -dims ./miner_test --testnet --seconds 120 --max-shares 0 --threads 6 --suggest-diff 0.001
+```
+
+Quieter soak (fewer submits while vardiff climbs), still an honest pool target:
+
+```sh
+caffeinate -dims ./miner_test --testnet --seconds 120 --max-shares 0 --threads 6 --suggest-diff 1
+```
+
+| Field | Value |
+|-------|-------|
+| Machine | MacBookPro18,3 |
+| Branch | PLACEHOLDER |
+| Endpoint | PLACEHOLDER |
+| Duration | PLACEHOLDER |
+| Threads | PLACEHOLDER |
+| H/s | PLACEHOLDER |
+| Difficulty | PLACEHOLDER |
+| Shares | PLACEHOLDER |
+| `TIME_SPLIT_PCT` | PLACEHOLDER |
+| `TIME_SPLIT_GAPS` | PLACEHOLDER |
+| `TIME_SPLIT_GAPS_DETAIL` | PLACEHOLDER |
+| `BATCHES` | PLACEHOLDER (`early_share` expected well below section 10's 651/3372 if the finish-the-slice path is doing the work) |
+| Result | PLACEHOLDER |
+
+Harness lines (paste under this heading):
+
+```
+PLACEHOLDER
+TIME_SPLIT ...
+TIME_SPLIT_PCT ...
+TIME_SPLIT_CPU ...
+TIME_SPLIT_FLIGHT ...
+TIME_SPLIT_OVERLAP ...
+TIME_SPLIT_GAPS ...
+TIME_SPLIT_GAPS_PCT ...
+TIME_SPLIT_GAPS_DETAIL ...
+BATCHES ...
+```
+
+**Expected direction vs section 10 (not a measurement):** share-check wall down from 17.01%, hash fraction up, `hashes_per_flight` nearer the full `2<<20` assignment (2097152), `early_share` near 0 aside from real cancels. Offline 6T reference on main was ~72.7 MH/s (2M nonce timed); live section 10 was ~57.8 MH/s.

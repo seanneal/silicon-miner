@@ -84,9 +84,10 @@ make testnet
 - Default mining username is throwaway testnet P2WPKH `tb1qhpe5prj25dsaxjnhq0ukj689xrcy8ede76p2up` (mining-only; not a savings wallet).
 - Fallback pool `testnet3.solopool.com:3332` also accepts `tb1…` (and honors `mining.suggest_difficulty`).
 - Default pool difficulty without suggest is often **16384** (~weeks at ~25 MH/s). Always pass `--suggest-diff` for CPU education runs.
+- `--suggest-diff 0.001` is the default so `make testnet` can accept a share quickly. For a long H/s soak (`--max-shares 0`), that easy suggestion floods submits until the pool vardiffs (a Mac soak climbed 0.001 → 0.16). Pass `--suggest-diff 1` for a quieter soak. The miner still checks each nonce against the pool's `mining.set_difficulty` target; `mining.suggest_difficulty` is only a request.
 - Hash path stays **pure asm**; C does Stratum, merkle/header setup, and share-target checks.
 - While workers hash, the main thread polls the socket. A new `mining.notify` is parsed and its midstate is built into a side buffer during that hash. `clean_jobs` cancels the in-flight scan so stale work stops; a non-clean notify finishes the current batch, then switches to the already-built header. The summary field `jobs_staged_while_hashing` counts notifies staged before the batch ended.
-- A worker that finds a share queues it immediately and stops only its own slice. The main thread writes `mining.submit` on the next poll (`stratum_submit_async`) and counts the reply later. The other workers keep hashing through that round-trip.
+- A worker that finds a share queues it immediately and finishes the rest of its nonce range. Siblings are not cancelled. The main thread writes `mining.submit` on the next poll (`stratum_submit_async`) and counts the reply later. A share does not roll extranonce2: the next batch continues the nonce cursor on the same header until the 32-bit nonce space wraps, a new job is staged, or `clean_jobs` cancels the scan.
 - Live session note: notify parsing must fully skip long `coinb1`/`coinb2` strings before reading `version`/`nbits`/`ntime` (truncated scan previously left ntime empty → pool “Difficulty too low”).
 
 ## Metrics
@@ -121,13 +122,13 @@ The default timed batch, `--soak`, and the testnet summary print where the wall 
 |-------|--------|
 | `batch_setup_s` | From deciding to start a batch until the **first** worker is about to enter the hash loop (nonce split, `pthread_create`, pin). Later workers' spawn delay overlaps that first worker and stays inside `flight_s` |
 | `teardown_s` | From the **last** worker leaving the hash loop until `pthread_join` has collected results, plus full-batch bookkeeping before the next start. Includes the main thread still blocked in `select` after workers have already stopped |
-| `share_restart_s` | Extra wall after that join when a share hit rebuilds on a new extranonce2. Header build and submit writes already in `midstate_s` / `submit_s` are not counted again |
+| `share_restart_s` | Extra wall after that join when a short batch rolls extranonce2 (a slice stopped before its assignment). A share that finishes the slice keeps the header and does not add this gap. Header build and submit writes already in `midstate_s` / `submit_s` are not counted again |
 | `cancel_restart_s` | Extra wall after that join when `clean_jobs` / cancel resumes work |
 | `end_drain_s` | `stratum_submit_drain` after hashing has stopped (pool reply wait) |
 | `status_s` | STATUS / soak printf while no batch is in flight |
 | `unexplained_s` | Residual of `other_s` |
 
-A share stops **only that worker's slice**. The batch's flight wall is still the slowest slice. `early_share` means the batch hashed fewer nonces than it was assigned because at least one slice stopped on a share. It does not mean every worker aborted. `early_clean` means `clean_jobs` or end-of-run cancel stopped the batch short of its assignment. `full` finished the assignment.
+A live share is queued and that worker **finishes its slice**. Siblings finish theirs too. The batch's flight wall is still the slowest slice. `early_share` means the batch hashed fewer nonces than it was assigned because a slice stopped early (the synchronous share-scan selftest still stops at the first hit). It does not mean every worker aborted. A live soak should stay on `full` across share hits. `early_clean` means `clean_jobs` or end-of-run cancel stopped the batch short of its assignment. `full` finished the assignment, including when a share was found along the way.
 
 `TIME_SPLIT_GAPS_DETAIL` splits the join-side part of `teardown_s` (not an extra percentage): `wake_s` is from the last worker's exit until the main thread notices the batch is done; `join_s` is `pthread_join` after that. `wake_s + join_s` is that join-side teardown, not the post-join bookkeeping also folded into `teardown_s`. While a batch is in flight the main thread `select`s on the Stratum socket and a self-pipe. The last worker writes one byte after it leaves the hash loop, so that `select` returns without waiting out the poll timeout. Socket data still wakes the same `select`, which is what keeps job staging and async submit overlapped with hashing.
 
