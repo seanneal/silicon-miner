@@ -76,6 +76,12 @@ void stratum_close(stratum_client_t *c);
 /* Non-blocking-ish poll: read socket, handle notify/difficulty/replies. */
 int  stratum_poll(stratum_client_t *c, int timeout_ms);
 
+/* Same as stratum_poll, and also return when wake_fd is readable.
+ * wake_fd < 0 watches the socket only. A readable wake_fd is drained
+ * and *woke is set to 1 (woke may be NULL). Socket bytes are still read
+ * when both fire. The select wait stays in poll_wait_ns. */
+int  stratum_poll_wake(stratum_client_t *c, int timeout_ms, int wake_fd, int *woke);
+
 /* Build 80-byte header for job + extranonce2 + nonce. Returns 0 on success. */
 int  stratum_build_header(const stratum_client_t *c, uint64_t extranonce2,
                           uint32_t nonce, uint8_t header80[80]);

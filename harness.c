@@ -12,10 +12,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <unistd.h>
 #include <stdatomic.h>
+#include <sys/socket.h>
+#include <sys/select.h>
 #include "mono_clock.h"
 
 #ifdef __APPLE__
@@ -87,6 +91,10 @@ static int g_pin_cores = 1;
 /* Set by the testnet loop so a clean_jobs notify stops stale hashing. */
 static _Atomic int g_scan_cancel = 0;
 static _Atomic int g_scan_finished = 0;
+/* Last finishing scan worker writes one byte. Main select watches the
+ * read end together with the Stratum socket. -1 until the pipe is open. */
+static int g_batch_wake_r = -1;
+static int g_batch_wake_w = -1;
 
 static void be_words_from_block(uint32_t w_be[16], const uint8_t block[64]) {
     for (int i = 0; i < 16; i++) {
@@ -141,8 +149,9 @@ static double monotonic_seconds(void) {
  *                    about to enter the hash loop (range split, spawn, pin)
  *   teardown_s     — last worker left the hash loop until join has collected
  *                    results, plus full-batch bookkeeping before the next
- *                    start. Includes the main thread still blocked in poll
- *                    after workers have already stopped.
+ *                    start. The in-flight select also watches a self-pipe
+ *                    the last worker writes, so this tail is wakeup latency
+ *                    rather than the rest of the poll timeout.
  *   share_restart_s — extra wall after that join when a share hit restarts
  *                    on a new extranonce2 (stall midstate/submit removed)
  *   cancel_restart_s — same, when clean_jobs / cancel resumes work
@@ -182,7 +191,7 @@ static int g_in_flight;
  * Gap buckets are main-thread only (workers publish t_start_ns / t_end_ns;
  * the main thread reads them after join). No lock on the nonce loop.
  * wake_s + join_s split the join-side part of teardown; they are not added
- * again on the 100% line.
+ * again on the 100% line. wake_s ends when the self-pipe wakes select.
  */
 static uint64_t g_gap_setup_ns;
 static uint64_t g_gap_teardown_ns;
@@ -717,6 +726,7 @@ typedef struct {
     uint32_t hashed;
     int pin_index;
     _Atomic int *finished; /* optional; testnet background scan */
+    int wake_n;            /* signal the self-pipe when finished reaches this */
     /* Set only for the live Stratum scan. A hit is queued from this worker
      * so the other slices keep hashing through the pool round-trip. */
     const char *job_id;
@@ -737,6 +747,49 @@ typedef struct {
 } scan_result_t;
 
 static int share_q_push(const char *job_id, const char *ntime, uint64_t en2, uint32_t nonce);
+
+static void batch_wake_drain(void) {
+    int fd = g_batch_wake_r;
+    if (fd < 0) return;
+    char buf[64];
+    for (;;) {
+        ssize_t n = read(fd, buf, sizeof buf);
+        if (n > 0) continue;
+        if (n < 0 && errno == EINTR) continue;
+        return;
+    }
+}
+
+/* One pipe for the process. O_NONBLOCK so the last worker never stalls
+ * if the main thread has not drained a previous byte. */
+static int batch_wake_open(void) {
+    if (g_batch_wake_r >= 0) return 0;
+    int fds[2];
+    if (pipe(fds) != 0) return -1;
+    for (int i = 0; i < 2; i++) {
+        int fl = fcntl(fds[i], F_GETFL, 0);
+        if (fl < 0 || fcntl(fds[i], F_SETFL, fl | O_NONBLOCK) != 0) {
+            close(fds[0]);
+            close(fds[1]);
+            return -1;
+        }
+    }
+    g_batch_wake_r = fds[0];
+    g_batch_wake_w = fds[1];
+    return 0;
+}
+
+static void batch_wake_signal(void) {
+    int fd = g_batch_wake_w;
+    if (fd < 0) return;
+    char b = 1;
+    for (;;) {
+        ssize_t n = write(fd, &b, 1);
+        if (n == 1) return;
+        if (n < 0 && errno == EINTR) continue;
+        return;
+    }
+}
 
 static void *mine_slice_worker(void *arg) {
     mine_slice_t *s = (mine_slice_t *)arg;
@@ -827,8 +880,14 @@ static void *scan_slice_worker(void *arg) {
         s->timed = 1;
     }
 
-    if (s->finished)
-        atomic_fetch_add_explicit(s->finished, 1, memory_order_release);
+    if (s->finished) {
+        /* t_end_ns is already stored. The release add publishes it.
+         * Only the worker that brings the count to wake_n writes the
+         * pipe, after that add, so select cannot wake early. */
+        int nfin = atomic_fetch_add_explicit(s->finished, 1, memory_order_release) + 1;
+        if (s->wake_n > 0 && nfin == s->wake_n)
+            batch_wake_signal();
+    }
     return NULL;
 }
 
@@ -1024,6 +1083,7 @@ static scan_result_t scan_share_n(const uint32_t mid[8], const uint32_t w_be[16]
         slices[i].hashed = 0;
         slices[i].pin_index = i;
         slices[i].finished = NULL;
+        slices[i].wake_n = 0;
         slices[i].job_id = NULL;
         slices[i].ntime = NULL;
         slices[i].en2 = 0;
@@ -1286,6 +1346,8 @@ static void run_metrics(uint32_t batch, const uint32_t mid[8], const uint32_t w_
         printf(" TTFN_S=%.9f\n", ttfn_s);
 }
 
+static int selftest_batch_wake(int threads);
+
 static int run_selftest(int threads) {
     if (selftest_partition() != 0)
         return 1;
@@ -1358,6 +1420,10 @@ static int run_selftest(int threads) {
         return 1;
     }
     printf("SELFTEST: TIME_SPLIT_GAPS counters armed\n");
+    if (selftest_batch_wake(1) != 0)
+        return 1;
+    if (threads != 1 && selftest_batch_wake(threads) != 0)
+        return 1;
     time_split_off();
     return 0;
 }
@@ -1526,6 +1592,8 @@ static int scan_start(scan_flight_t *f, const work_buf_t *w, uint32_t count, int
 
     atomic_store_explicit(&g_scan_cancel, 0, memory_order_relaxed);
     atomic_store_explicit(&g_scan_finished, 0, memory_order_relaxed);
+    /* Drop a byte from the previous batch before anyone new can write. */
+    batch_wake_drain();
 
     for (int i = 0; i < used; i++) {
         scan_slice_t *s = &f->slices[i];
@@ -1539,6 +1607,7 @@ static int scan_start(scan_flight_t *f, const work_buf_t *w, uint32_t count, int
         s->hashed = 0;
         s->pin_index = i;
         s->finished = &g_scan_finished;
+        s->wake_n = used;
         s->job_id = w->job_id;
         s->ntime = w->ntime;
         s->en2 = w->en2;
@@ -1563,6 +1632,102 @@ static int scan_start(scan_flight_t *f, const work_buf_t *w, uint32_t count, int
 static int scan_done(const scan_flight_t *f) {
     if (!f->running) return 1;
     return atomic_load_explicit(&g_scan_finished, memory_order_acquire) >= f->n;
+}
+
+/* Last worker must wake a blocked stratum_poll_wake well inside the
+ * timeout, and a later socket byte must still be delivered. */
+static int selftest_batch_wake(int threads) {
+    if (batch_wake_open() != 0) {
+        printf("SELFTEST: FAIL (wake pipe)\n");
+        return 1;
+    }
+    batch_wake_drain();
+
+    int sv[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+        printf("SELFTEST: FAIL (wake socketpair errno=%d)\n", errno);
+        return 1;
+    }
+    int fl = fcntl(sv[0], F_GETFL, 0);
+    if (fl < 0 || fcntl(sv[0], F_SETFL, fl | O_NONBLOCK) != 0) {
+        close(sv[0]);
+        close(sv[1]);
+        printf("SELFTEST: FAIL (wake socket flags)\n");
+        return 1;
+    }
+
+    stratum_client_t client;
+    memset(&client, 0, sizeof client);
+    client.fd = sv[0];
+
+    work_buf_t w;
+    memset(&w, 0, sizeof w);
+    compute_midstate(w.mid, GENESIS_HEADER);
+    build_block1_wbe(w.w_be, GENESIS_HEADER);
+    memset(w.target, 0, sizeof w.target);
+    snprintf(w.job_id, sizeof w.job_id, "wake");
+    snprintf(w.ntime, sizeof w.ntime, "00000000");
+    w.ready = 1;
+
+    scan_flight_t flight;
+    memset(&flight, 0, sizeof flight);
+    if (scan_start(&flight, &w, 32, threads) != 0) {
+        close(sv[0]);
+        close(sv[1]);
+        printf("SELFTEST: FAIL (wake scan_start threads=%d)\n", threads);
+        return 1;
+    }
+
+    int woke = 0;
+    uint64_t t0 = mono_ns();
+    int rc = stratum_poll_wake(&client, 2000, g_batch_wake_r, &woke);
+    uint64_t dt = mono_ns() - t0;
+    int done = scan_done(&flight);
+    int failed = 0;
+    if (rc < 0 || !woke || !done || dt >= 1500000000ULL) {
+        printf("SELFTEST: FAIL (wake poll rc=%d woke=%d done=%d dt_us=%llu threads=%d)\n",
+               rc, woke, done, (unsigned long long)(dt / 1000ull), threads);
+        failed = 1;
+        atomic_store_explicit(&g_scan_cancel, 1, memory_order_relaxed);
+    } else {
+        char ping = '\n';
+        if (write(sv[1], &ping, 1) != 1) {
+            printf("SELFTEST: FAIL (wake socket write errno=%d)\n", errno);
+            failed = 1;
+        } else {
+            woke = 0;
+            rc = stratum_poll_wake(&client, 2000, g_batch_wake_r, &woke);
+            /* A lone newline is an empty line. Socket must report data
+             * and the already-drained pipe must not look like another wake. */
+            if (rc != 1 || woke) {
+                printf("SELFTEST: FAIL (wake socket rc=%d woke=%d threads=%d)\n",
+                       rc, woke, threads);
+                failed = 1;
+            }
+        }
+    }
+
+    if (flight.running) {
+        if (time_split_on())
+            flight.t_notice_ns = mono_ns();
+        scan_result_t sr;
+        scan_join(&flight, &sr);
+        if (!failed && sr.hashes != 32) {
+            printf("SELFTEST: FAIL (wake hashes=%llu threads=%d)\n",
+                   (unsigned long long)sr.hashes, threads);
+            failed = 1;
+        }
+    } else if (!failed) {
+        printf("SELFTEST: FAIL (wake flight not running)\n");
+        failed = 1;
+    }
+
+    close(sv[0]);
+    close(sv[1]);
+    if (failed) return 1;
+    printf("SELFTEST: batch wake OK (threads=%d dt_us=%llu)\n",
+           threads, (unsigned long long)(dt / 1000ull));
+    return 0;
 }
 
 /*
@@ -1634,10 +1799,10 @@ static int run_soak(const uint32_t mid[8], const uint32_t w_be[16],
  *  TIME_SPLIT is printed with the summary.
  */
 
-static void poll_accounted(stratum_client_t *c, int timeout_ms) {
+static void poll_accounted(stratum_client_t *c, int timeout_ms, int wake_fd) {
     uint64_t w0 = c->poll_wait_ns;
     uint64_t b0 = c->poll_busy_ns;
-    stratum_poll(c, timeout_ms);
+    stratum_poll_wake(c, timeout_ms, wake_fd, NULL);
     if (!time_split_on()) return;
     uint64_t dw = c->poll_wait_ns - w0;
     uint64_t db = c->poll_busy_ns - b0;
@@ -1673,6 +1838,8 @@ static int run_testnet(const char *host, int port, const char *user, const char 
     }
 
     printf("STRATUM: difficulty=%.8g\n", client.difficulty);
+    if (batch_wake_open() != 0)
+        fprintf(stderr, "NOTE: batch wake pipe unavailable; in-flight poll keeps its timeout\n");
 
     work_buf_t active, staging;
     memset(&active, 0, sizeof active);
@@ -1707,7 +1874,7 @@ static int run_testnet(const char *host, int port, const char *user, const char 
 
         if (!flight.running) {
             if (!active.ready && prepare_work(&client, &active, active.en2) != 0) {
-                poll_accounted(&client, 50);
+                poll_accounted(&client, 50, -1);
                 continue;
             }
             if (scan_start(&flight, &active, scan_batch, threads) != 0) {
@@ -1717,7 +1884,11 @@ static int run_testnet(const char *host, int port, const char *user, const char 
             g_in_flight = 1;
         }
 
-        poll_accounted(&client, 20);
+        /* 20ms is only the backstop if the wake write fails. The last
+         * worker writes one byte to the self-pipe, so this select returns
+         * when the batch ends. Socket readability still wakes the same
+         * select, so job staging and async submit stay overlapped. */
+        poll_accounted(&client, 20, g_batch_wake_r);
         share_q_flush(&client);
 
         {
