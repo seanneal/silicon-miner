@@ -108,7 +108,7 @@ Later same-day live soaks (different vardiff and share counts) are in sections 9
 
 ## 6. Engineering vs formal experiments (status)
 
-Landed on `main` (PR #1 squash merge `86fe9cf`, 2026-09-26). TIME_SPLIT accounting landed (PR #3, `6d37fb6`, 2026-09-26). Wake-on-complete landed (PR #6, `36b83c5`, 2026-09-26); the post-fix Mac soak is in section 10.
+Landed on `main` (PR #1 squash merge `86fe9cf`, 2026-09-26). TIME_SPLIT accounting landed (PR #3, `6d37fb6`, 2026-09-26). Wake-on-complete landed (PR #6, `36b83c5`, 2026-09-26); the post-fix Mac soak is in section 10. Step 1 (share check + finish-the-slice) landed (PR #8, `a4ad0ba`, 2026-09-27); the Mac soak is in section 11.
 
 | ID | Item | Kind | Status |
 |----|------|------|--------|
@@ -117,7 +117,7 @@ Landed on `main` (PR #1 squash merge `86fe9cf`, 2026-09-26). TIME_SPLIT accounti
 | — | TIME_SPLIT wall accounting | eng | Done / on main (PR #3); Mac live soak in section 9 |
 | — | TIME_SPLIT_GAPS (split `other`) | eng | Mac soaks in section 10 (PR #5 pre-fix; PR #6 post-fix) |
 | — | In-flight wake-on-complete | eng | Done / on main (PR #6); Mac soak in section 10 |
-| — | Step 1 share check + finish slice | eng | Section 11; Mac soak **PLACEHOLDER** |
+| — | Step 1 share check + finish slice | eng | Done / on main (PR #8); Mac soak in section 11 |
 | E1 | P-core pin (`--pin` / `--no-pin`) | eng | Done / exercised on Mac |
 | E2 | Offline `--soak` | eng | Done |
 | E3 | Multi-thread `measure.sh` | eng | Done (MT peak watts TBD) |
@@ -274,60 +274,78 @@ Offline comparison commands (not a substitute for the live gap split):
 
 ## 11. Step 1 — share-path wall and early-share batches
 
-Ordinary engineering (not E6 / E7). Added 2026-09-27. Asm hash path (`sha256d_mine.s`) was not changed.
+Ordinary engineering (not E6 / E7). Merged to `main` as PR #8 (`a4ad0ba`, 2026-09-27). Asm hash path (`sha256d_mine.s`) was not changed. Mac numbers below are from MacBookPro18,3 (6P+2E), 2026-09-27 CT. qemu H/s is not used here.
 
-What changed, so the coordinator soak has a baseline to compare with section 10:
+What #8 changed:
 
 - The per-nonce share check compares `bswap32(digest[7])` to the top target word and reads the rest of the target only on a tie. It is the same Bitcoin integer compare as the old 32-byte walk (selftest oracle).
 - A live share is queued and that worker finishes its nonce range. Siblings are not cancelled. The batch does not roll extranonce2 just because a share hit; the nonce cursor continues on the same header until wrap, a new job, or `clean_jobs`.
-- `TIME_SPLIT` / `TIME_SPLIT_GAPS` / `BATCHES` still print. `early_share` on a live soak should drop (slices are no longer cut short by a hit). `share_restart_s` stays the short-batch fallback, not the common share path.
-- `--suggest-diff 0.001` is unchanged so a one-share proof still returns quickly. For a quieter H/s soak, pass `--suggest-diff 1`. That is only `mining.suggest_difficulty`; the check still uses the pool's `set_difficulty`.
+- `TIME_SPLIT` / `TIME_SPLIT_GAPS` / `BATCHES` still print. `share_restart_s` stays the short-batch fallback, not the common share path.
+- `--suggest-diff 0.001` is unchanged so a one-share proof still returns quickly. For a quieter H/s soak, pass `--suggest-diff 1`. That is only `mining.suggest_difficulty`; the check still uses the pool's `set_difficulty`. The soaks below used `0.001`, the same command as section 10.
 
-### Mac soak — PLACEHOLDER
-
-Coordinator fill-in. Do not treat qemu or this VM as Apple Silicon H/s.
-
-Same shape as section 10 so the share-path delta is comparable:
+Both live runs:
 
 ```sh
 caffeinate -dims ./miner_test --testnet --seconds 120 --max-shares 0 --threads 6 --suggest-diff 0.001
 ```
 
-Quieter soak (fewer submits while vardiff climbs), still an honest pool target:
+Offline rows are a 2M-nonce timed batch (`./miner_test --threads N 2000000`), not the live soak.
 
-```sh
-caffeinate -dims ./miner_test --testnet --seconds 120 --max-shares 0 --threads 6 --suggest-diff 1
-```
+### Same-day baseline (main, before #8)
+
+Measured 2026-09-27 CT on `main` before PR #8. This is the same-day comparison point. Section 10 (2026-09-26, ~57.8 MH/s, `early_share=651`) is the previous day.
 
 | Field | Value |
 |-------|-------|
-| Machine | MacBookPro18,3 |
-| Branch | PLACEHOLDER |
-| Endpoint | PLACEHOLDER |
-| Duration | PLACEHOLDER |
-| Threads | PLACEHOLDER |
-| H/s | PLACEHOLDER |
-| Difficulty | PLACEHOLDER |
-| Shares | PLACEHOLDER |
-| `TIME_SPLIT_PCT` | PLACEHOLDER |
-| `TIME_SPLIT_GAPS` | PLACEHOLDER |
-| `TIME_SPLIT_GAPS_DETAIL` | PLACEHOLDER |
-| `BATCHES` | PLACEHOLDER (`early_share` expected well below section 10's 651/3372 if the finish-the-slice path is doing the work) |
-| Result | PLACEHOLDER |
+| Machine | MacBookPro18,3 (6P+2E) |
+| Offline 2M, 6T | **72698193** (~72.7 MH/s) |
+| Offline 2M, 8T | **88094085** (~88.1 MH/s) |
+| Live command | `--testnet --seconds 120 --max-shares 0 --threads 6 --suggest-diff 0.001` |
+| Live H/s | **56696392** (~56.7 MH/s) |
+| Hashes | **6803691663** |
+| Threads | **6** |
+| Difficulty | ended **0.08** (vardiff) |
+| Shares | **777** accepted / **779** submitted |
+| `TIME_SPLIT_PCT` | hash=**82.06** share=**17.67** other=**0.27** |
+| `TIME_SPLIT_GAPS_DETAIL` | wake_s=**0.0941** join_s=**0.0664** |
+| `BATCHES` | started=**3309** early_share=**633** early_clean=**2** full=**2674** avg_flight_s=**0.0362** hashes_per_flight=**2056117** |
 
-Harness lines (paste under this heading):
+Reported lines:
 
 ```
-PLACEHOLDER
-TIME_SPLIT ...
-TIME_SPLIT_PCT ...
-TIME_SPLIT_CPU ...
-TIME_SPLIT_FLIGHT ...
-TIME_SPLIT_OVERLAP ...
-TIME_SPLIT_GAPS ...
-TIME_SPLIT_GAPS_PCT ...
-TIME_SPLIT_GAPS_DETAIL ...
-BATCHES ...
+TIME_SPLIT_PCT hash=82.06 share=17.67 other=0.27
+TIME_SPLIT_GAPS_DETAIL wake_s=0.0941 join_s=0.0664
+BATCHES started=3309 early_share=633 early_clean=2 full=2674 avg_flight_s=0.0362 hashes_per_flight=2056117
 ```
 
-**Expected direction vs section 10 (not a measurement):** share-check wall down from 17.01%, hash fraction up, `hashes_per_flight` nearer the full `2<<20` assignment (2097152), `early_share` near 0 aside from real cancels. Offline 6T reference on main was ~72.7 MH/s (2M nonce timed); live section 10 was ~57.8 MH/s.
+### Step 1 soak (PR #8)
+
+Measured 2026-09-27 CT on `cursor/share-path-step1-dbd2`, squash-merged to `main` as PR #8 / `a4ad0ba`. Same live command as the baseline above.
+
+| Field | Value |
+|-------|-------|
+| Machine | MacBookPro18,3 (6P+2E) |
+| Offline 2M, 6T | **62739193** (~62.7 MH/s) |
+| Offline 2M, 8T | **90991811** (~91.0 MH/s) |
+| Live command | `--testnet --seconds 120 --max-shares 0 --threads 6 --suggest-diff 0.001` |
+| Live H/s | **57614710** (~57.6 MH/s) |
+| Hashes | **6913834498** |
+| Threads | **6** |
+| Difficulty | ended **0.16** (vardiff) |
+| Shares | **788** accepted / **788** submitted |
+| `TIME_SPLIT_PCT` | hash=**85.84** share=**13.77** other=**0.39** |
+| `TIME_SPLIT_GAPS_DETAIL` | wake_s=**0.2129** join_s=**0.0730** |
+| `BATCHES` | started=**3297** early_share=**0** early_clean=**2** full=**3295** avg_flight_s=**0.0363** hashes_per_flight=**2097008** |
+| Result | **PASS** (merged) |
+
+Reported lines:
+
+```
+TIME_SPLIT_PCT hash=85.84 share=13.77 other=0.39
+TIME_SPLIT_GAPS_DETAIL wake_s=0.2129 join_s=0.0730
+BATCHES started=3297 early_share=0 early_clean=2 full=3295 avg_flight_s=0.0363 hashes_per_flight=2097008
+```
+
+**Ops win vs the same-day baseline:** live H/s **+1.6%** (56.7 → 57.6 MH/s; 56696392 → 57614710) and `early_share` **633 → 0**. `hashes_per_flight` moved from **2056117** to **2097008**, next to the full `2<<20` assignment (2097152). Share-check wall moved **17.67% → 13.77%** and hash **82.06% → 85.84%**. The Step 1 run ended at a higher vardiff (**0.16** vs **0.08**) and still accepted every submit (788/788).
+
+The offline 6T timed batch (**72.7 → 62.7 MH/s**) is short-bench noise against that baseline, not the live result. Offline 8T was **88.1 → 91.0 MH/s** on the same kind of short batch. Wake stayed a fraction of a second (wake_s **0.0941 → 0.2129**). E6 and E7 were not started.
