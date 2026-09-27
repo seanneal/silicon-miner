@@ -124,7 +124,7 @@ Landed on `main` (PR #1 squash merge `86fe9cf`, 2026-09-26). TIME_SPLIT accounti
 | E3 | Multi-thread `measure.sh` | eng | Done (MT peak watts TBD) |
 | E4 | Job midstate staging while hashing | eng | Done / soak saw `staged_overlap=1` |
 | E5 | Async share submit | eng | Done / soak exercised path |
-| E6 | `exp/sha-pipe-schedule` | **formal experiment fork** | This branch (section 13). Not merged |
+| E6 | `exp/sha-pipe-schedule` | **formal experiment fork** | Measured (section 13). Leave #12 unmerged |
 | E7 | `exp/dual-job` | **formal experiment fork** | Not started |
 
 Protocol: E6 and E7 each get their own branch, measure, and decision. Do not stack them.
@@ -427,7 +427,7 @@ Short offline batches move around. Section 11 already recorded 8T timed batches 
 
 ## 13. E6 — SHA-pipe schedule A/B (`exp/sha-pipe-schedule`)
 
-Formal experiment fork. Not ordinary engineering, and not for squash-merge until a Mac measurement decides. E7 is not in this change. qemu H/s is not an Apple Silicon number.
+Formal experiment fork. Mac numbers below are from 2026-09-27 CT. Leave PR #12 unmerged. E7 is not in this change. qemu H/s is not an Apple Silicon number.
 
 ### Hypothesis
 
@@ -484,9 +484,9 @@ Run on this branch under `qemu-aarch64-static -cpu max` (`make` / `./miner_test.
 | `TIME_SPLIT` / `TIME_SPLIT_GAPS` counters armed | **PASS** |
 | `RESULT` | **PASS** |
 
-### Mac offline — PLACEHOLDER
+### Mac offline (2026-09-27 CT)
 
-Short 2M-nonce batches are noisy (sections 11 and 12). Prefer the same command on both arms, back to back, machine awake. 1T is one thread. Default is `hw.physicalcpu` (8 on the 6P+2E MacBookPro18,3).
+Machine: **Seans-MacBook-Pro**. HEAD `550c0c1706682233e43121942d6e79625f830373`. Short 2M-nonce batches. 1T is one thread. Default is 8 threads.
 
 ```sh
 ./miner_test --sha-sched a --threads 1 2000000
@@ -495,18 +495,18 @@ Short 2M-nonce batches are noisy (sections 11 and 12). Prefer the same command o
 ./miner_test --sha-sched b 2000000
 ```
 
-| Arm | Threads | H/s | `SHA_SCHED` line | Notes |
-|-----|---------|-----|------------------|-------|
-| A | 1 | PLACEHOLDER | PLACEHOLDER | offline timed batch |
-| B | 1 | PLACEHOLDER | PLACEHOLDER | offline timed batch |
-| A | default | PLACEHOLDER | PLACEHOLDER | offline timed batch |
-| B | default | PLACEHOLDER | PLACEHOLDER | offline timed batch |
-| B vs A, 1T | | PLACEHOLDER % | | single-digit or flat expected |
-| B vs A, default | | PLACEHOLDER % | | single-digit or flat expected |
+| Arm | Threads | H/s | `SHA_SCHED` | Notes |
+|-----|---------|-----|-------------|-------|
+| A | 1 | **25061086** (25.061 MH/s) | A | `TIMING hit=0 elapsed=0.079805 s threads=1` |
+| B | 1 | **24956949** (24.957 MH/s) | B | `elapsed=0.080138 s` |
+| A | default 8 | **117591721** (117.592 MH/s) | A | `elapsed=0.017008 s` |
+| B | default 8 | **124385845** (124.386 MH/s) | B | `elapsed=0.016079 s` |
+| B vs A, 1T | 1 | **−0.42%** | | 24956949 vs 25061086. Flat / tiny loss for B |
+| B vs A, default | 8 | **+5.78%** | | 124385845 vs 117591721. Short-bench noise; not a win |
 
-### Mac live soak — PLACEHOLDER
+### Mac live soak (2026-09-27 CT)
 
-Same shape as section 12. The scan hash is `_sha256_compress` in both arms, so a live delta is not evidence for or against the lane-major mine loop. Record it so the arms are not mixed up with a code change on the scan path.
+Same machine and HEAD. tn3, 120 s, `--suggest-diff 0.001`, `THREADS=8` (6 performance cores at interactive QoS, 2 efficiency cores at utility QoS). Both soaks printed `SHA_SCHED`. The CLI notes `--sha-sched` selects the offline mine entry; the testnet scan stays on `_sha256_compress`.
 
 ```sh
 caffeinate -dims ./miner_test --sha-sched a --testnet --seconds 120 --max-shares 0 --suggest-diff 0.001
@@ -515,15 +515,22 @@ caffeinate -dims ./miner_test --sha-sched b --testnet --seconds 120 --max-shares
 
 | Field | Schedule A | Schedule B |
 |-------|------------|------------|
-| Machine | PLACEHOLDER | PLACEHOLDER |
-| `SHA_SCHED` | A | B |
-| Threads | PLACEHOLDER (default) | PLACEHOLDER (default) |
-| Live H/s | PLACEHOLDER | PLACEHOLDER |
-| Hashes | PLACEHOLDER | PLACEHOLDER |
-| Shares accepted / submitted | PLACEHOLDER | PLACEHOLDER |
-| `TIME_SPLIT_PCT` hash / share / other | PLACEHOLDER | PLACEHOLDER |
-| `TIME_SPLIT_GAPS_DETAIL` wake_s / join_s | PLACEHOLDER | PLACEHOLDER |
-| `BATCHES` early_share / hashes_per_flight | PLACEHOLDER | PLACEHOLDER |
-| B vs A live H/s | PLACEHOLDER % | |
+| Machine | Seans-MacBook-Pro | Seans-MacBook-Pro |
+| `SHA_SCHED` | **A** | **B** |
+| Threads | **8** (default; 6P interactive + 2E utility) | **8** (default; 6P interactive + 2E utility) |
+| Live H/s | **67977975** (67.978 MH/s) | **63599780** (63.600 MH/s) |
+| Hashes | not in the reported lines | not in the reported lines |
+| Difficulty ended | **~0.16** | **~0.08** |
+| Shares accepted / submitted | **967 / 969** (2 rejected) | **844 / 846** (2 rejected) |
+| `TIME_SPLIT_PCT` hash / share / other | **86.99 / 12.65 / 0.36** | **87.53 / 12.13 / 0.34** |
+| `TIME_SPLIT_GAPS_DETAIL` wake_s / join_s | not in the reported lines | not in the reported lines |
+| `BATCHES` | started=**3890** full=**3889** early_share=**0** | started=**3640** full=**3638** early_share=**0** |
+| B vs A live H/s | **−6.44%** (63599780 vs 67977975) | |
 
-**Decision:** leave this PR open. Do not treat a flat result as a failed build. Merge only if the Mac offline hash path shows a repeatable gain worth keeping; otherwise close the experiment.
+### Interpretation
+
+Offline 1T is the schedule-sensitive signal: A and B are flat (B **−0.42%**, 25.061 → 24.957 MH/s). Offline default 8T moved **+5.78%** on a ~17 ms batch. That short bench is too noisy to claim a win (sections 11 and 12 already show 8T timed batches swinging by tens of MH/s).
+
+The live soaks printed `SHA_SCHED`, and the scan hash in both arms is still `_sha256_compress`. The live **−6.44%** (67.978 → 63.600 MH/s) is not a clean E6 treatment effect. Pool difficulty also differed: A ended near **0.16**, B near **0.08**. Share wall stayed near 12% either way (12.65% and 12.13%). `early_share` stayed **0**.
+
+**Do not merge B as ordinary engineering.** Prefer A, the current main schedule. Coordinator will leave #12 unmerged. The experiment PR stays open with these numbers.
