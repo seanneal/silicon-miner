@@ -8,9 +8,9 @@
  * queued and the slice finishes; it does not cancel siblings or roll
  * extranonce2. TIME_SPLIT (mono_clock.h) accounts wall time around those calls.
  *
- * E7 (--dual-job on) is a formal experiment: two midstate slots stay live and
- * a worker whose slot runs dry claims the other one. Default --dual-job off
- * is the single-job path. The asm hash path is not rewritten.
+ * Dual-job is a merged optional feature. Default --dual-job off is the
+ * single-job path. --dual-job on keeps two hot midstate slots, and a worker
+ * whose slot runs dry claims the other one. The asm hash path is not rewritten.
  */
 #include <stdio.h>
 #include <stdint.h>
