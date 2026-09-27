@@ -1,5 +1,19 @@
 # silicon-miner
 
+## Hash rate: start and end
+
+MacBookPro18,3. Both charts use the published rows in [STATS.md](STATS.md).
+
+The first recorded baseline is the early single-core midstate harness: about **20.7 MH/s**, 1 thread, offline `_sha256d_mine_midstate` (section 2, 2026-09-26).
+
+![Start: about 20.7 MH/s, 1T midstate, early harness baseline, 2026-09-26](docs/hashrate-start.png)
+
+After E7 on `main`, default 8 threads and `--dual-job on` (section 13, 2026-09-27): offline soak **125.1 MH/s** (`SOAK_AVG_H/s=125091135`, 120 s) and live tn3 **100.3 MH/s** (`100343446`, 120 s). The live bar is the per-nonce `sha256_compress` / `sha256d_asm_one` scan.
+
+![End: 125.1 MH/s offline soak and 100.3 MH/s live testnet, 8T dual-job on, 2026-09-27](docs/hashrate-end.png)
+
+A later confirm on `main` (`8c5287f`), about 60 s with `--dual-job on`, was about **95.8 MH/s** (`early_share` 0, `underfeed` 0, share wall about 9%).
+
 ## What this is
 
 Educational Apple Silicon (M1 / ARM64) Bitcoin SHA-256d miner. The goal is education, correctness, and using the silicon well. Profit is out of scope.
