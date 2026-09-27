@@ -196,28 +196,7 @@ void stratum_share_target(double difficulty, uint8_t target_be[32]) {
     target_be[7] = (uint8_t)(v);
 }
 
-bool stratum_hash_meets_target(const uint32_t digest_words[8],
-                               const uint8_t target_be[32]) {
-    /* SHA words → 32-byte BE digest */
-    uint8_t hash[32];
-    for (int i = 0; i < 8; i++) {
-        hash[i * 4 + 0] = (uint8_t)(digest_words[i] >> 24);
-        hash[i * 4 + 1] = (uint8_t)(digest_words[i] >> 16);
-        hash[i * 4 + 2] = (uint8_t)(digest_words[i] >> 8);
-        hash[i * 4 + 3] = (uint8_t)(digest_words[i]);
-    }
-    /* Bitcoin: interpret hash as little-endian uint256; compare to target as LE uint256.
-     * Equivalent: compare bytes from index 31 down to 0 against target_be which is BE,
-     * so hash_le_byte[i] = hash[i], target_le_byte[i] = target_be[31-i].
-     * hash_int <= target_int iff comparing from MSB of the LE number (byte 31). */
-    for (int i = 31; i >= 0; i--) {
-        uint8_t hb = hash[i];                 /* LE byte i */
-        uint8_t tb = target_be[31 - i];       /* LE byte i of BE target */
-        if (hb < tb) return true;
-        if (hb > tb) return false;
-    }
-    return true;
-}
+/* stratum_hash_meets_target is inline in stratum.h (top-word compare). */
 
 /* ---------- JSON helpers (minimal) ---------- */
 

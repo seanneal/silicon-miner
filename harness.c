@@ -4,8 +4,9 @@
  * Hash path remains pure ARM64 asm (sha256d_mine.s). Workers call
  * _sha256d_mine_midstate on disjoint nonce ranges. Stratum share checks are a
  * target inequality, so that loop partitions the same way and hashes each
- * slice with the existing asm compress (sha256d_asm_one).
- * TIME_SPLIT (mono_clock.h) accounts wall time around those calls.
+ * slice with the existing asm compress (sha256d_asm_one). A live share is
+ * queued and the slice finishes; it does not cancel siblings or roll
+ * extranonce2. TIME_SPLIT (mono_clock.h) accounts wall time around those calls.
  */
 #include <stdio.h>
 #include <stdint.h>
@@ -88,7 +89,10 @@ static void on_sigint(int sig) { (void)sig; g_stop = 1; }
 
 /* Default on. --no-pin clears it. macOS only; Linux reports PIN=na. */
 static int g_pin_cores = 1;
-/* Set by the testnet loop so a clean_jobs notify stops stale hashing. */
+/* Set by the testnet loop so a clean_jobs notify stops stale hashing.
+ * Not checked on every nonce: a share-path load here was pure overhead.
+ * 256 nonces is a few tens of microseconds at live rates. */
+#define SCAN_CANCEL_EVERY 256u
 static _Atomic int g_scan_cancel = 0;
 static _Atomic int g_scan_finished = 0;
 /* Last finishing scan worker writes one byte. Main select watches the
@@ -152,8 +156,10 @@ static double monotonic_seconds(void) {
  *                    start. The in-flight select also watches a self-pipe
  *                    the last worker writes, so this tail is wakeup latency
  *                    rather than the rest of the poll timeout.
- *   share_restart_s — extra wall after that join when a share hit restarts
- *                    on a new extranonce2 (stall midstate/submit removed)
+ *   share_restart_s — extra wall after that join when a short batch (a slice
+ *                    stopped before its assignment) rolls extranonce2.
+ *                    A live share that finishes the slice does not (stall
+ *                    midstate/submit removed)
  *   cancel_restart_s — same, when clean_jobs / cancel resumes work
  *   end_drain_s    — stratum_submit_drain after hashing has stopped
  *   status_s       — status/soak printf while no batch is in flight
@@ -727,11 +733,14 @@ typedef struct {
     int pin_index;
     _Atomic int *finished; /* optional; testnet background scan */
     int wake_n;            /* signal the self-pipe when finished reaches this */
-    /* Set only for the live Stratum scan. A hit is queued from this worker
-     * so the other slices keep hashing through the pool round-trip. */
+    /* Live Stratum scan sets job_id and stop_on_share=0: each hit is queued
+     * from this worker and the slice finishes its nonce range. The synchronous
+     * selftest scan leaves job_id NULL and sets stop_on_share so early_share
+     * stays armed. Siblings are not cancelled by a share either way. */
     const char *job_id;
     const char *ntime;
     uint64_t en2;
+    int stop_on_share;
     int timed;
     uint64_t t_start_ns;
     uint64_t t_end_ns;
@@ -832,13 +841,18 @@ static void *scan_slice_worker(void *arg) {
     uint64_t hash_raw = 0;
     uint64_t submit_ticks = 0;
     uint32_t timed_n = 0;
+    uint32_t msw[8];
     if (timing) {
         s->t_start_ns = mono_ns();
         t_enter = mono_ticks();
     }
+    /* Once per slice. The hot path compares one bswapped word, then the
+     * rest of the target only when that word ties. */
+    stratum_target_msw(s->target, msw);
 
     for (uint32_t i = 0; i < s->nonce_count; i++) {
-        if (g_stop || atomic_load_explicit(&g_scan_cancel, memory_order_relaxed))
+        if ((i & (SCAN_CANCEL_EVERY - 1u)) == 0 &&
+            (g_stop || atomic_load_explicit(&g_scan_cancel, memory_order_relaxed)))
             break;
         uint32_t nonce = s->nonce_start + i;
         if (timing) {
@@ -850,9 +864,12 @@ static void *scan_slice_worker(void *arg) {
             sha256d_asm_one(s->mid, s->w_be, nonce, dig);
         }
         s->hashed++;
-        if (stratum_hash_meets_target(dig, s->target)) {
-            s->hit = 1;
-            s->found = nonce;
+        if (__builtin_expect(stratum_hash_meets_target_msw(dig, msw), 0)) {
+            /* Nonces are scanned in order, so the first hit is the earliest. */
+            if (!s->hit) {
+                s->hit = 1;
+                s->found = nonce;
+            }
             if (s->job_id) {
                 if (timing) {
                     uint64_t d0 = mono_ticks();
@@ -862,7 +879,8 @@ static void *scan_slice_worker(void *arg) {
                     (void)share_q_push(s->job_id, s->ntime, s->en2, nonce);
                 }
             }
-            break;
+            if (s->stop_on_share)
+                break;
         }
     }
 
@@ -1087,6 +1105,9 @@ static scan_result_t scan_share_n(const uint32_t mid[8], const uint32_t w_be[16]
         slices[i].job_id = NULL;
         slices[i].ntime = NULL;
         slices[i].en2 = 0;
+        /* First-hit stop keeps the synchronous selftest's early_share
+         * counter armed. Live scan_start finishes the range instead. */
+        slices[i].stop_on_share = 1;
         slices[i].timed = 0;
         slices[i].t_start_ns = 0;
         slices[i].t_end_ns = 0;
@@ -1117,9 +1138,9 @@ static scan_result_t scan_share_n(const uint32_t mid[8], const uint32_t w_be[16]
     }
     if (time_split_on()) {
         g_flight_hashes += r.hashes;
-        /* A share stops only that slice. The batch is "early" when the
-         * assignment was not fully hashed. No separate restart gap here:
-         * the caller returns. Testnet restart time is measured in the loop. */
+        /* stop_on_share cuts this scan short on a hit. The batch is "early"
+         * when the assignment was not fully hashed. No separate restart gap
+         * here: the caller returns. Testnet restart time is measured in the loop. */
         batch_count_end(r.hit && r.hashes < nonce_count, 0);
     }
     return r;
@@ -1346,10 +1367,125 @@ static void run_metrics(uint32_t batch, const uint32_t mid[8], const uint32_t w_
         printf(" TTFN_S=%.9f\n", ttfn_s);
 }
 
+static int selftest_target_equiv(void);
+static int selftest_share_continue(int threads);
 static int selftest_batch_wake(int threads);
+
+/* Byte walk kept only as the oracle for the word compare. */
+static int share_meets_ref(const uint32_t digest_words[8], const uint8_t target_be[32]) {
+    uint8_t hash[32];
+    for (int i = 0; i < 8; i++) {
+        hash[i * 4 + 0] = (uint8_t)(digest_words[i] >> 24);
+        hash[i * 4 + 1] = (uint8_t)(digest_words[i] >> 16);
+        hash[i * 4 + 2] = (uint8_t)(digest_words[i] >> 8);
+        hash[i * 4 + 3] = (uint8_t)(digest_words[i]);
+    }
+    for (int i = 31; i >= 0; i--) {
+        uint8_t hb = hash[i];
+        uint8_t tb = target_be[31 - i];
+        if (hb < tb) return 1;
+        if (hb > tb) return 0;
+    }
+    return 1;
+}
+
+static void digest_as_target(const uint32_t dig[8], uint8_t target_be[32]) {
+    uint8_t hash[32];
+    for (int i = 0; i < 8; i++)
+        store_be32(hash + i * 4, dig[i]);
+    for (int i = 0; i < 32; i++)
+        target_be[31 - i] = hash[i];
+}
+
+static int expect_meet(const char *what, const uint32_t dig[8], const uint8_t target[32]) {
+    int ref = share_meets_ref(dig, target);
+    int got = stratum_hash_meets_target(dig, target) ? 1 : 0;
+    uint32_t msw[8];
+    stratum_target_msw(target, msw);
+    int got_msw = stratum_hash_meets_target_msw(dig, msw) ? 1 : 0;
+    if (ref != got || ref != got_msw) {
+        printf("SELFTEST: FAIL (target equiv %s ref=%d got=%d msw=%d)\n",
+               what, ref, got, got_msw);
+        return 1;
+    }
+    return 0;
+}
+
+static int selftest_target_equiv(void) {
+    uint32_t dig[8];
+    uint8_t target[32];
+    int n = 0;
+
+    memset(dig, 0, sizeof dig);
+    memset(target, 0, sizeof target);
+    if (expect_meet("zero", dig, target)) return 1;
+    n++;
+
+    memset(target, 0xff, sizeof target);
+    if (expect_meet("zero-hash-all-target", dig, target)) return 1;
+    n++;
+
+    memset(dig, 0xff, sizeof dig);
+    memset(target, 0, sizeof target);
+    if (expect_meet("all-hash-zero-target", dig, target)) return 1;
+    n++;
+
+    memset(target, 0xff, sizeof target);
+    if (expect_meet("all", dig, target)) return 1;
+    n++;
+
+    /* Top words equal, only the last target byte decides. */
+    memset(dig, 0, sizeof dig);
+    memset(target, 0, sizeof target);
+    target[31] = 1;
+    if (expect_meet("tail-hit", dig, target)) return 1;
+    n++;
+    dig[0] = 0x02000000u;
+    if (expect_meet("tail-miss", dig, target)) return 1;
+    n++;
+    dig[0] = 0x01000000u;
+    if (expect_meet("tail-eq", dig, target)) return 1;
+    n++;
+
+    /* diff1: top word is 0, so the fast path must fall through to word 1. */
+    {
+        const double diffs[] = {0.001, 0.16, 1.0, 16384.0, 1e-6};
+        uint32_t state = 0xC0FFEEu;
+        for (unsigned di = 0; di < sizeof diffs / sizeof diffs[0]; di++) {
+            stratum_share_target(diffs[di], target);
+            memset(dig, 0, sizeof dig);
+            if (expect_meet("diff-zero-hash", dig, target)) return 1;
+            n++;
+            for (int k = 0; k < 64; k++) {
+                for (int w = 0; w < 8; w++) {
+                    state = state * 1664525u + 1013904223u;
+                    dig[w] = state;
+                }
+                char label[64];
+                snprintf(label, sizeof label, "diff %.8g n=%d", diffs[di], n);
+                if (expect_meet(label, dig, target)) return 1;
+                n++;
+            }
+            /* Hash equal to this target, then one step above and below
+             * the top byte, so both the tie path and the first-word
+             * reject are checked against the byte oracle. */
+            digest_as_target(dig, target);
+            if (expect_meet("equal-hash", dig, target)) return 1;
+            n++;
+            target[0] ^= 0x80u;
+            if (expect_meet("top-byte-flip", dig, target)) return 1;
+            n++;
+        }
+    }
+
+    printf("SELFTEST: share target equiv OK (cases=%d)\n", n);
+    return 0;
+}
 
 static int run_selftest(int threads) {
     if (selftest_partition() != 0)
+        return 1;
+    if (selftest_target_equiv() != 0)
         return 1;
 
     int st = sha256d_genesis_selftest();
@@ -1396,6 +1532,10 @@ static int run_selftest(int threads) {
     if (selftest_scan_once(1) != 0)
         return 1;
     if (threads != 1 && selftest_scan_once(threads) != 0)
+        return 1;
+    if (selftest_share_continue(1) != 0)
+        return 1;
+    if (threads != 1 && selftest_share_continue(threads) != 0)
         return 1;
     if (g_cpu_hash_ticks == 0 || g_cpu_share_ticks == 0 ||
         g_flight_wall_ns == 0 || g_scan_slices_timed == 0) {
@@ -1611,6 +1751,7 @@ static int scan_start(scan_flight_t *f, const work_buf_t *w, uint32_t count, int
         s->job_id = w->job_id;
         s->ntime = w->ntime;
         s->en2 = w->en2;
+        s->stop_on_share = 0;
         if (pthread_create(&f->tid[i], NULL, scan_slice_worker, s) != 0) {
             fprintf(stderr, "NOTE: pthread_create failed at scan worker %d\n", i);
             atomic_store_explicit(&g_scan_cancel, 1, memory_order_relaxed);
@@ -1632,6 +1773,115 @@ static int scan_start(scan_flight_t *f, const work_buf_t *w, uint32_t count, int
 static int scan_done(const scan_flight_t *f) {
     if (!f->running) return 1;
     return atomic_load_explicit(&g_scan_finished, memory_order_acquire) >= f->n;
+}
+
+/* Live path: one real hit inside the range, and every nonce still hashed.
+ * Target is the minimum hash in the window, so later nonces miss and the
+ * queue gets that one share. stop_on_share is off (scan_start). */
+static int selftest_share_continue(int threads) {
+    uint32_t mid[8], w_be[16];
+    compute_midstate(mid, GENESIS_HEADER);
+    build_block1_wbe(w_be, GENESIS_HEADER);
+
+    const uint32_t count = 48;
+    uint32_t start = 0;
+    uint32_t best = 0;
+    uint32_t best_dig[8];
+    uint8_t target[32];
+    int guard = 0;
+    for (;;) {
+        sha256d_asm_one(mid, w_be, start, best_dig);
+        best = start;
+        digest_as_target(best_dig, target);
+        for (uint32_t n = 1; n < count; n++) {
+            uint32_t dig[8];
+            uint8_t back[32];
+            sha256d_asm_one(mid, w_be, start + n, dig);
+            if (!stratum_hash_meets_target(dig, target))
+                continue;
+            digest_as_target(dig, back);
+            if (stratum_hash_meets_target(best_dig, back))
+                continue; /* tie: keep the earlier nonce */
+            memcpy(best_dig, dig, sizeof best_dig);
+            best = start + n;
+            memcpy(target, back, sizeof target);
+        }
+        /* The hit has to sit strictly inside its slice. Otherwise stopping
+         * at the share still hashes the full assignment and this test
+         * cannot see the difference. One thread is the strict case. */
+        int interior = 0;
+        if (best + 1u < start + count) {
+            uint32_t pst[MAX_MINE_THREADS];
+            uint32_t pcn[MAX_MINE_THREADS];
+            int used = partition_nonce_ranges(start, count, clamp_threads(threads), pst, pcn);
+            for (int si = 0; si < used; si++) {
+                if (pcn[si] < 2) continue;
+                uint32_t last = pst[si] + pcn[si] - 1u;
+                if (best >= pst[si] && best < last) {
+                    interior = 1;
+                    break;
+                }
+            }
+            if (interior || threads <= 1)
+                break;
+        }
+        start += 3u;
+        if (++guard > 8) {
+            if (threads <= 1) {
+                printf("SELFTEST: FAIL (share continue no interior hit)\n");
+                return 1;
+            }
+            break;
+        }
+    }
+
+    work_buf_t w;
+    memset(&w, 0, sizeof w);
+    memcpy(w.mid, mid, sizeof w.mid);
+    memcpy(w.w_be, w_be, sizeof w.w_be);
+    memcpy(w.target, target, sizeof w.target);
+    snprintf(w.job_id, sizeof w.job_id, "cont");
+    snprintf(w.ntime, sizeof w.ntime, "00000000");
+    w.nonce_cursor = start;
+    w.ready = 1;
+
+    pthread_mutex_lock(&g_share_mu);
+    g_share_head = 0;
+    g_share_tail = 0;
+    pthread_mutex_unlock(&g_share_mu);
+
+    scan_flight_t flight;
+    if (scan_start(&flight, &w, count, threads) != 0) {
+        printf("SELFTEST: FAIL (share continue scan_start threads=%d)\n", threads);
+        return 1;
+    }
+    if (time_split_on())
+        flight.t_notice_ns = mono_ns();
+    scan_result_t sr;
+    scan_join(&flight, &sr);
+
+    int queued = 0;
+    int queued_best = 0;
+    pthread_mutex_lock(&g_share_mu);
+    for (int i = g_share_head; i != g_share_tail; i = (i + 1) % SHARE_Q) {
+        queued++;
+        if (g_share_q[i].nonce == best)
+            queued_best = 1;
+    }
+    g_share_head = 0;
+    g_share_tail = 0;
+    pthread_mutex_unlock(&g_share_mu);
+
+    if (!sr.hit || sr.nonce != best || sr.hashes != count || !queued_best) {
+        printf("SELFTEST: FAIL (share continue threads=%d hit=%d nonce=%08x exp=%08x "
+               "hashes=%llu queued=%d)\n",
+               threads, sr.hit, sr.nonce, best,
+               (unsigned long long)sr.hashes, queued);
+        return 1;
+    }
+    printf("SELFTEST: share continue OK (threads=%d nonce=%08x hashes=%llu queued=%d)\n",
+           threads, best, (unsigned long long)sr.hashes, queued);
+    return 0;
 }
 
 /* Last worker must wake a blocked stratum_poll_wake well inside the
@@ -1838,6 +2088,16 @@ static int run_testnet(const char *host, int port, const char *user, const char 
     }
 
     printf("STRATUM: difficulty=%.8g\n", client.difficulty);
+    /* 0.001 proves a share quickly (make testnet). On a long unlimited
+     * soak the pool then vardiffs through a submit flood (seen 0.001 → 0.16).
+     * Suggesting 1 asks for a quieter rate. The check still uses whatever
+     * mining.set_difficulty the pool sends. */
+    if (max_shares == 0 && suggest_diff > 0.0 && suggest_diff < 1.0) {
+        printf("NOTE: suggest_diff %.8g with --max-shares 0 can flood submits "
+               "before vardiff rises. For an H/s soak pass --suggest-diff 1. "
+               "The share target is still the pool difficulty.\n",
+               suggest_diff);
+    }
     if (batch_wake_open() != 0)
         fprintf(stderr, "NOTE: batch wake pipe unavailable; in-flight poll keeps its timeout\n");
 
@@ -1912,8 +2172,8 @@ static int run_testnet(const char *host, int port, const char *user, const char 
         if (flight.running && scan_done(&flight)) {
             scan_result_t sr;
             uint32_t batch_start = active.nonce_cursor;
+            uint32_t assigned = flight.assigned;
             int abandoned = atomic_load_explicit(&g_scan_cancel, memory_order_relaxed);
-            int staged_at_end = staged;
             /* Workers have left the hash loop. t_notice is the moment the
              * main thread sees that, so teardown can split poll-wake from join.
              * Rebuilds and submits here stall the next batch when g_in_flight
@@ -1924,22 +2184,23 @@ static int run_testnet(const char *host, int port, const char *user, const char 
             scan_join(&flight, &sr);
             restart_window_open();
             hashes += sr.hashes;
-            /* Hits were queued by the worker that found them, while the
-             * other slices kept hashing. Flush anything still local. */
+            /* Hits were queued by the worker that found them. The slice
+             * kept hashing, so a share does not by itself leave a hole. */
             if (sr.hit)
                 printf("SHARE_CANDIDATE nonce=0x%08x en2=%llu job=%s\n",
                        sr.nonce, (unsigned long long)active.en2, active.job_id);
             share_q_flush(&client);
 
-            /* 2 = clean/cancel resume, 1 = share hit restarts extranonce2,
-             * 0 = full assignment or a non-clean job switch (teardown). */
+            /* 2 = clean/cancel resume, 1 = short batch rolls extranonce2,
+             * 0 = full assignment (share or not) or a job switch (teardown).
+             * A finished slice keeps this header. Rolling en2 on every share
+             * threw away the rest of the nonce space and rebuilt midstate. */
             int restart_kind = 0;
             if (abandoned)
                 restart_kind = 2;
-            else if (sr.hit && !staged_at_end)
-                restart_kind = 1;
 
             int leave = 0;
+            int short_batch = assigned > 0 && sr.hashes < assigned;
             if (staged) {
                 active = staging;
                 memset(&staging, 0, sizeof staging);
@@ -1952,13 +2213,15 @@ static int run_testnet(const char *host, int port, const char *user, const char 
                 active.nonce_cursor = 0;
                 if (client.have_job && prepare_work(&client, &active, 0) == 0)
                     printf("STRATUM: resumed on job id=%s after clean cancel\n", active.job_id);
-            } else if (sr.hit) {
+            } else if (short_batch && !g_stop) {
                 uint64_t en2 = active.en2 + 1;
                 if (prepare_work(&client, &active, en2) != 0) {
-                    fprintf(stderr, "STRATUM: rebuild after share failed\n");
+                    fprintf(stderr, "STRATUM: rebuild after short batch failed\n");
                     leave = 1;
                 }
-            } else {
+                if (sr.hit)
+                    restart_kind = 1;
+            } else if (!g_stop) {
                 uint64_t next = (uint64_t)batch_start + sr.hashes;
                 if (sr.hashes == 0) next = (uint64_t)batch_start + scan_batch;
                 /* batch_start + hashes is uint64, so wrap is next past 2^32.
@@ -2089,6 +2352,11 @@ static void usage(const char *argv0) {
         "  %s --testnet           mine BTCLab testnet3 (suggest_diff=0.001)\n"
         "  %s --stratum HOST:PORT --user USER [--pass PASS] [--suggest-diff D]\n"
         "                         [--seconds N] [--max-shares N] [--threads N]\n"
+        "\n"
+        "Default --suggest-diff is 0.001 so a short run can accept one share.\n"
+        "For an H/s soak (--max-shares 0) pass --suggest-diff 1 so the pool\n"
+        "is not asked to start at a share every few million hashes. The\n"
+        "target check still uses mining.set_difficulty from the pool.\n"
         "\n"
         "Educational testnet only. No mainnet / AntPool.\n",
         argv0, argv0, argv0, argv0, argv0, argv0, argv0);

@@ -90,10 +90,54 @@ int  stratum_build_header(const stratum_client_t *c, uint64_t extranonce2,
  * target_be[32] is big-endian 256-bit target (MSB first). */
 void stratum_share_target(double difficulty, uint8_t target_be[32]);
 
+/* Pack target_be into 8 big-endian uint32 words, MSB word first.
+ * Same bytes as target_be; done once per slice, not once per nonce. */
+static inline void stratum_target_msw(const uint8_t target_be[32], uint32_t msw[8])
+    __attribute__((unused));
+static inline void stratum_target_msw(const uint8_t target_be[32], uint32_t msw[8]) {
+    for (int i = 0; i < 8; i++) {
+        const uint8_t *p = target_be + (i * 4);
+        msw[i] = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                 ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+    }
+}
+
+/* digest_words: 8 SHA-256 state words (as produced by sha256_compress).
+ * Returns true if the Bitcoin hash integer is <= target.
+ *
+ * The hash is a little-endian uint256. Its most significant byte is the
+ * low byte of word 7, so bswap32(word 7) is the top 32 bits of that integer.
+ * msw[] is the target in the same order (stratum_target_msw). A miss almost
+ * always returns on word 0; lower words are only read when the top word ties.
+ * This is the same comparison as walking the 32 hash bytes from index 31. */
+static inline bool stratum_hash_meets_target_msw(const uint32_t digest_words[8],
+                                                const uint32_t msw[8])
+    __attribute__((unused));
+static inline bool stratum_hash_meets_target_msw(const uint32_t digest_words[8],
+                                                const uint32_t msw[8]) {
+    uint32_t h = __builtin_bswap32(digest_words[7]);
+    if (h > msw[0]) return false;
+    if (h < msw[0]) return true;
+    for (int i = 1; i < 8; i++) {
+        h = __builtin_bswap32(digest_words[7 - i]);
+        uint32_t t = msw[i];
+        if (h > t) return false;
+        if (h < t) return true;
+    }
+    return true;
+}
+
 /* digest_words: 8 SHA-256 state words (as produced by sha256_compress).
  * Returns true if Bitcoin LE hash <= target. */
-bool stratum_hash_meets_target(const uint32_t digest_words[8],
-                               const uint8_t target_be[32]);
+static inline bool stratum_hash_meets_target(const uint32_t digest_words[8],
+                                            const uint8_t target_be[32])
+    __attribute__((unused));
+static inline bool stratum_hash_meets_target(const uint32_t digest_words[8],
+                                            const uint8_t target_be[32]) {
+    uint32_t msw[8];
+    stratum_target_msw(target_be, msw);
+    return stratum_hash_meets_target_msw(digest_words, msw);
+}
 
 /* Submit share and wait for the reply. Returns 1 accepted, 0 rejected, -1 error. */
 int  stratum_submit(stratum_client_t *c, uint64_t extranonce2,
